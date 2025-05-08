@@ -25,6 +25,7 @@ using Amazon.Runtime.CredentialManagement;
 using System.Security.Cryptography;
 using SolidWorks.Interop.swconst;
 using System.Windows.Forms;
+using System.Net;
 
 namespace analytics_AddIn
 {
@@ -46,7 +47,9 @@ namespace analytics_AddIn
         private const string API_Analitics_URL = "https://api-ncsw.xpertme.com/api/createSession";
         private const string TOKEN_Xpertme_URL = "https://api-academy.xpertcad.com/v2/system/oauth/token";
         private const string TOKEN_Analitics_URL = "https://api-ncsw.xpertme.com/api/auth";
-        private const string ConfigFilePath = "C:\\ProgramData\\SOLIDWORKS\\"+ AppName +"_sessions.txt";
+        private string ConfigFilePath = GetSource() + "\\" + AppName + "\\" + AppName + "_sessions.txt";
+        private string LogFilePath = GetSource() + "\\" + AppName + "\\" + AppName + "_log.txt";
+        private string tempFolder = GetSource() + "\\" + AppName + "\\temp\\";
         private ICommandManager commandManager;
         private SldWorks solidWorksEventHandler;
         private Hashtable openDocuments;
@@ -63,6 +66,7 @@ namespace analytics_AddIn
         {
             try
             {
+                var logger = new Class1();
                 var addInTitle = t.GetCustomAttribute<DisplayNameAttribute>()?.DisplayName ?? t.ToString();
                 var addInDesc = t.GetCustomAttribute<DescriptionAttribute>()?.Description ?? t.ToString();
                 var addInKeyPath = string.Format(ADDIN_KEY_TEMPLATE, t.GUID);
@@ -72,10 +76,9 @@ namespace analytics_AddIn
                     addInKey.SetValue(ADD_IN_TITLE_REG_KEY_NAME, addInTitle);
                     addInKey.SetValue(ADD_IN_DESCRIPTION_REG_KEY_NAME, addInDesc);
 
-                    // 📌 Ruta dinámica del icono dentro del directorio del Add-in
                     string pathInstall = GetSource();
-                    string iconPath = Path.Combine(pathInstall, AppName,"AddinIcon.bmp");
-                    addInKey.SetValue("Icon Path", iconPath, RegistryValueKind.String);  // Ruta del icono
+                    string iconPath = Path.Combine(pathInstall, AppName, AppName + ".bmp");
+                    addInKey.SetValue("Icon Path", iconPath, RegistryValueKind.String);
                 }
 
                 var addInStartupKeyPath = string.Format(ADDIN_STARTUP_KEY_TEMPLATE, t.GUID);
@@ -84,13 +87,15 @@ namespace analytics_AddIn
                     addInStartupKey.SetValue(null, 1, RegistryValueKind.DWord);
                 }
 
-                Console.WriteLine("Add-in registrado correctamente con ícono.");
+                logger.LogToFile("Add-in registrado correctamente con ícono.");
             }
             catch (Exception ex)
             {
-                Console.WriteLine("Error al registrar el Add-in: " + ex.Message);
+                var logger = new Class1();
+                logger.LogToFile("Error al registrar el Add-in: " + ex.Message);
             }
         }
+
 
 
         [ComUnregisterFunction]
@@ -98,35 +103,51 @@ namespace analytics_AddIn
         {
             try
             {
+                var logger = new Class1();
                 Registry.LocalMachine.DeleteSubKey(string.Format(ADDIN_KEY_TEMPLATE, t.GUID));
                 Registry.CurrentUser.DeleteSubKey(string.Format(ADDIN_STARTUP_KEY_TEMPLATE, t.GUID));
+                logger.LogToFile("Add-in desregistrado correctamente.");
             }
             catch (Exception e)
             {
-                Console.WriteLine("Error while unregistering the addin: " + e.Message);
+                var logger = new Class1();
+                logger.LogToFile("Error al desregistrar el Add-in: " + e.Message);
             }
         }
 
+
         public bool ConnectToSW(object solidWorksInstance, int addInId)
         {
-            solidWorksApp = solidWorksInstance as ISldWorks;
-            addInCookie = addInId;
-            solidWorksApp.SetAddinCallbackInfo(0, this, addInCookie);
-            commandManager = solidWorksApp.GetCommandManager(addInCookie);
-            InitializeEventHandlers();
-
-            if (IsInternetAvailable())
-            {
-                solidWorksApp.SendMsgToUser("Si hay internet");
-                Task.Run(async () => { await CheckForUpdates(); await SendSesionSW(); SendJwl(); });
-            }
-            else
-            {
-                solidWorksApp.SendMsgToUser("No hay conexión a internet. No se pudo verificar la versión.");
-            }
-
             try
             {
+                solidWorksApp = solidWorksInstance as ISldWorks;
+                addInCookie = addInId;
+                solidWorksApp.SetAddinCallbackInfo(0, this, addInCookie);
+                commandManager = solidWorksApp.GetCommandManager(addInCookie);
+                InitializeEventHandlers();
+
+                if (IsInternetAvailable())
+                {
+                    LogToFile("Conexión a internet detectada. Verificando actualizaciones...");
+                    Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await CheckForUpdates();
+                            await SendSesionSW();
+                            await SendJwl();
+                        }
+                        catch (Exception asyncEx)
+                        {
+                            LogToFile("Error en tareas asincrónicas de conexión: " + asyncEx.Message);
+                        }
+                    });
+                }
+                else
+                {
+                    LogToFile("No hay conexión a internet. No se pudo verificar la versión.");
+                }
+
                 if (DoesConfigFileExist())
                 {
                     ReadConfigFile();
@@ -135,23 +156,65 @@ namespace analytics_AddIn
                 {
                     CreateConfigFile();
                 }
+
+                return true;
             }
             catch (Exception ex)
             {
-                solidWorksApp.SendMsgToUser("Error al verificar el archivo de configuración: " + ex.Message);
+                LogToFile("Error en ConnectToSW: " + ex.Message);
+                return false;
             }
-            return true;
         }
+
 
         /// 
         /// Configura los manejadores de eventos para capturar eventos de SOLIDWORKS.
         /// 
         private void InitializeEventHandlers()
         {
-            solidWorksEventHandler = (SldWorks)solidWorksApp;
-            openDocuments = new Hashtable();
-            //ValidateLicense();
+            try
+            {
+                solidWorksEventHandler = (SldWorks)solidWorksApp;
+                openDocuments = new Hashtable();
+                //ValidateLicense();
+            }
+            catch (Exception ex)
+            {
+                LogToFile("Error al inicializar manejadores de eventos: " + ex.Message);
+            }
         }
+
+        private void LogToFile(string message, string level = "INFO")
+        {
+            try
+            {
+                string timeStamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+                string logEntry = "";
+
+                if (level.ToUpper() == "ERROR")
+                {
+                    logEntry = $@"
+                                [---------------------------- ERROR ----------------------------]
+                                Fecha: {timeStamp}
+                                Mensaje: {message}
+                                [--------------------------------------------------------------]";
+                }
+                else
+                {
+                    logEntry = $"{timeStamp} [INFO] - {message}";
+                }
+
+                using (StreamWriter writer = new StreamWriter(LogFilePath, true))
+                {
+                    writer.WriteLine(logEntry);
+                }
+            }
+            catch
+            {
+                Debug.Print("Error al escribir en el log.");
+            }
+        }
+
 
         /// 
         /// ////////////////////////////////////////////////////////////////////////// Trabajar con el archivo txt de sesiones /////////////////////////////////////////////////////////////////////////
@@ -297,7 +360,9 @@ namespace analytics_AddIn
                 string token = await GetToken(TOKEN_Analitics_URL);
                 if (string.IsNullOrEmpty(token))
                 {
-                    Debug.Print("Error: No se pudo obtener el token.");
+                    string msg = "Error: No se pudo obtener el token.";
+                    Debug.Print(msg);
+                    LogToFile(msg);
                     return;
                 }
 
@@ -316,25 +381,25 @@ namespace analytics_AddIn
                 };
 
                 string requestBody = JsonConvert.SerializeObject(jsonPayload, Formatting.Indented);
+
                 var request = new HttpRequestMessage(HttpMethod.Post, API_Analitics_URL);
-
-                // 🔹 Corregir encabezado de autorización (Agregar "Bearer ")
-                request.Headers.Add("Authorization", $"{token}");
-
+                request.Headers.Add("authorization", token);
                 request.Content = new StringContent(requestBody, Encoding.UTF8, "application/json");
 
                 var response = await client.SendAsync(request);
 
+                string responseText = await response.Content.ReadAsStringAsync();
+
                 if (!response.IsSuccessStatusCode)
                 {
-                    Debug.Print($"Error en la solicitud: {response.StatusCode} - {await response.Content.ReadAsStringAsync()}");
+                    string errorMsg = $"Error en la solicitud: {response.StatusCode} - {responseText}";
+                    Debug.Print(errorMsg);
+                    LogToFile(errorMsg);
                     return;
                 }
 
-                string responseText = await response.Content.ReadAsStringAsync();
                 JObject jsonResponse = JObject.Parse(responseText);
 
-                // 🔹 Validar si "message" existe antes de acceder a él
                 if (jsonResponse.ContainsKey("message"))
                 {
                     JArray messageArray = (JArray)jsonResponse["message"];
@@ -343,22 +408,34 @@ namespace analytics_AddIn
                     if (firstItem != null && firstItem["statusInsert"]?.ToString() == "Insertado")
                     {
                         ClearAlltext();
+                        LogToFile("Sesión enviada correctamente.");
+                    }
+                    else
+                    {
+                        LogToFile("Advertencia: La sesión no fue insertada correctamente.");
                     }
                 }
                 else
                 {
-                    Debug.Print("Advertencia: No se encontró 'message' en la respuesta.");
+                    string msg = "Advertencia: No se encontró 'message' en la respuesta.";
+                    Debug.Print(msg);
+                    LogToFile(msg);
                 }
             }
             catch (HttpRequestException httpEx)
             {
-                Debug.Print("Error de red en SendSesionSW: " + httpEx.Message);
+                string msg = "Error de red en SendSesionSW: " + httpEx.Message;
+                Debug.Print(msg);
+                LogToFile(msg);
             }
             catch (Exception ex)
             {
-                Debug.Print("Error en SendSesionSW: " + ex.Message);
+                string msg = "Error en SendSesionSW: " + ex.Message;
+                Debug.Print(msg);
+                LogToFile(msg);
             }
         }
+
 
         /// 
         /// Obtiene todo el contenido del archivo.
@@ -630,54 +707,78 @@ namespace analytics_AddIn
         ///
         private async Task CheckForUpdates()
         {
-            string token = await GetToken(TOKEN_Xpertme_URL);
-            if (token != null)
+            try
             {
-                var request = new HttpRequestMessage(HttpMethod.Post, API_Xpertme_URL);
-                request.Headers.Add("Authorization", $"Bearer {token}");
-                request.Content = new StringContent("{ \"mode\": \"dev\" }", Encoding.UTF8, "application/json");
-
-                var response = await client.SendAsync(request);
-                response.EnsureSuccessStatusCode();
-
-                var responseBody = await response.Content.ReadAsStringAsync();
-                JObject jsonObject = JObject.Parse(responseBody);
-                var lastInstaller = jsonObject["data"]?["lastInstaller"];
-
-                VERSION = lastInstaller?["Version"]?.ToString();
-                cambios = lastInstaller?["ReleaseNotes"]?.ToString();
-                link = lastInstaller?["publicDllLink"]?.ToString();
-
-                if (!string.IsNullOrEmpty(VERSION) && CompareVersions())
+                string token = await GetToken(TOKEN_Xpertme_URL);
+                if (token != null)
                 {
-                    var d = new update();
-                    d.versionActual = versionActual;
-                    d.versionNueva = VERSION;
-                    d.cambios = cambios;
-                    d.link = link;
-                    d.ShowDialog();
-                    d.Dispose();
+                    var request = new HttpRequestMessage(HttpMethod.Post, API_Xpertme_URL);
+                    request.Headers.Add("Authorization", $"Bearer {token}");
+                    request.Content = new StringContent("{ \"mode\": \"dev\" }", Encoding.UTF8, "application/json");
+
+                    var response = await client.SendAsync(request);
+                    response.EnsureSuccessStatusCode();
+
+                    var responseBody = await response.Content.ReadAsStringAsync();
+                    JObject jsonObject = JObject.Parse(responseBody);
+                    var lastInstaller = jsonObject["data"]?["lastInstaller"];
+
+                    VERSION = lastInstaller?["Version"]?.ToString();
+                    cambios = lastInstaller?["ReleaseNotes"]?.ToString();
+                    link = lastInstaller?["publicDllLink"]?.ToString();
+
+                    if (!string.IsNullOrEmpty(VERSION) && CompareVersions())
+                    {
+                        var d = new update();
+                        d.versionActual = versionActual;
+                        d.versionNueva = VERSION;
+                        d.cambios = cambios;
+                        d.link = link;
+                        d.ShowDialog();
+                        d.Dispose();
+                    }
                 }
             }
+            catch (Exception ex)
+            {
+                string errorMsg = "Error al verificar actualizaciones: " + ex.Message;
+                LogToFile(errorMsg);  // Agregar el error al log
+                Debug.Print(errorMsg);
+                LogToFile(errorMsg);
+            }
         }
+
 
         /// 
         /// Obtiene la version actual de analitycs y la compara con la ultima.
         ///
         private bool CompareVersions()
-                {
-                    var assemblyVersion = System.Diagnostics.FileVersionInfo.GetVersionInfo(System.Reflection.Assembly.GetExecutingAssembly().Location).FileVersion;
-                    var v1 = assemblyVersion.Split('.').Select(int.Parse).ToList();
-                    versionActual = assemblyVersion;
-                    var v2 = VERSION.Split('.').Select(int.Parse).ToList();
-                    for (int i = 0; i < v1.Count; i++)
-                        {
-                            if (v2[i] > v1[i]) return true;
-                            if (v2[i] < v1[i]) return false;
-                        }
+        {
+            try
+            {
+                var assemblyVersion = System.Diagnostics.FileVersionInfo.GetVersionInfo(System.Reflection.Assembly.GetExecutingAssembly().Location).FileVersion;
+                var v1 = assemblyVersion.Split('.').Select(int.Parse).ToList();
+                versionActual = assemblyVersion;
+                var v2 = VERSION.Split('.').Select(int.Parse).ToList();
 
-                    return false;
+                for (int i = 0; i < v1.Count; i++)
+                {
+                    if (v2[i] > v1[i]) return true;
+                    if (v2[i] < v1[i]) return false;
                 }
+
+                return false;
+            }
+            catch (Exception ex)
+            {
+                string errorMsg = "Error al comparar versiones: " + ex.Message;
+                LogToFile(errorMsg);  // Agregar el error al log
+                Debug.Print(errorMsg);
+                LogToFile(errorMsg);
+                return false; // Por defecto, no hay actualización
+            }
+        }
+
 
         /// 
         /// Obtiene el token de forma dinamica.
@@ -686,192 +787,342 @@ namespace analytics_AddIn
         {
             try
             {
+                ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
                 var request = new HttpRequestMessage(HttpMethod.Post, url);
-                // Si la URL es TOKEN_URL, usa autenticación básica
+
                 if (url == TOKEN_Xpertme_URL)
                 {
                     request.Headers.Add("Authorization", "Basic YW5hbHl0aWNzX3N3OlRtMFF6QTlR");
                     request.Content = new FormUrlEncodedContent(new[]
                     {
-                    new KeyValuePair<string, string>("grant_type", "client_credentials"),
-                    new KeyValuePair<string, string>("scope", "analytics:installers:get")
-                });
+                        new KeyValuePair<string, string>("grant_type", "client_credentials"),
+                        new KeyValuePair<string, string>("scope", "analytics:installers:get")
+                    });
+                }
+                else if (url == TOKEN_Analitics_URL)
+                {
+                    request.Content = new StringContent("", Encoding.UTF8, "application/x-www-form-urlencoded");
                 }
                 else if (!string.IsNullOrEmpty(requestBody))
                 {
-                    // Si tiene un cuerpo de solicitud, lo envía como JSON
                     request.Content = new StringContent(requestBody, Encoding.UTF8, "application/json");
                 }
-                var response = await client.SendAsync(request);
-                response.EnsureSuccessStatusCode();
 
+                var response = await client.SendAsync(request);
                 string responseBody = await response.Content.ReadAsStringAsync();
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    string errorMsg = $"Error al obtener token: {response.StatusCode} - {responseBody}";
+                    LogToFile(errorMsg);  // Agregar el error al log
+                    Debug.Print(errorMsg);
+                    LogToFile(errorMsg);
+                    return null;
+                }
+
                 JObject jsonObject = JObject.Parse(responseBody);
 
-                return jsonObject["token"]?.ToString() ?? jsonObject["accessToken"]?.ToString();
+                string token = jsonObject["token"]?.ToString() ?? jsonObject["accessToken"]?.ToString();
+
+                if (string.IsNullOrEmpty(token))
+                {
+                    string errorMsg = "Error: El token no se encontró en la respuesta.";
+                    LogToFile(errorMsg);  // Agregar el error al log
+                    Debug.Print(errorMsg);
+                    LogToFile(errorMsg);
+                    return null;
+                }
+
+                Debug.Print("Token obtenido correctamente.");
+                return token;
             }
             catch (HttpRequestException httpEx)
             {
-                Debug.Print("Error HTTP: " + httpEx.Message);
+                string errorMsg = "Error HTTP en GetToken: " + httpEx.Message;
+                LogToFile(errorMsg);  // Agregar el error al log
+                Debug.Print(errorMsg);
+                LogToFile(errorMsg);
                 return null;
             }
             catch (Exception ex)
             {
-                Debug.Print("Error general: " + ex.Message);
+                string errorMsg = "Error general en GetToken: " + ex.Message;
+                LogToFile(errorMsg);  // Agregar el error al log
+                Debug.Print(errorMsg);
+                LogToFile(errorMsg);
                 return null;
             }
-
         }
+
+
+
         #endregion
 
         /// 
         /// ////////////////////////////////////////////////////////////////////////// Enviar archivos a AWS /////////////////////////////////////////////////////////////////////////
         /// 
 
-        private void SendJwl()
+        private async Task SendJwl()
         {
-            string baseVersion, currentVersion, hotfixes;
-            solidWorksApp.GetBuildNumbers2(out baseVersion, out currentVersion, out hotfixes);
+            try
+            {
+                string baseVersion, currentVersion, hotfixes;
+                solidWorksApp.GetBuildNumbers2(out baseVersion, out currentVersion, out hotfixes);
 
-            string versionSW = ExtractSWVersion(baseVersion);
-            string userFolder = System.Environment.GetFolderPath(System.Environment.SpecialFolder.ApplicationData);
-            string solidworksPath = Path.Combine(userFolder, "SOLIDWORKS", $"SOLIDWORKS {versionSW}");
-
-            UploadIfExists(solidworksPath, "swxJRNL.swj");
-            UploadIfExists(solidworksPath, "swxJRNL.bak");
+                string versionSW = ExtractSWVersion(baseVersion);
+                string userFolder = System.Environment.GetFolderPath(System.Environment.SpecialFolder.ApplicationData);
+                string solidworksPath = Path.Combine(userFolder, "SOLIDWORKS", $"SOLIDWORKS {versionSW}");
+                LogToFile("mando llamar al sendJwl");
+                await UploadIfExists(solidworksPath, "swxJRNL.swj");
+                await UploadIfExists(solidworksPath, "swxJRNL.bak");
+            }
+            catch (Exception ex)
+            {
+                string errorMsg = "Error al enviar archivos JRNL: " + ex.Message;
+                LogToFile(errorMsg);  // Log error
+                Debug.Print(errorMsg);
+                LogToFile(errorMsg);
+            }
         }
 
         private string ExtractSWVersion(string baseVersion)
         {
-            int startIndex = baseVersion.IndexOf("20");
-            int endIndex = baseVersion.IndexOf("_");
+            try
+            {
+                int startIndex = baseVersion.IndexOf("20");
+                int endIndex = baseVersion.IndexOf("_");
 
-            return (startIndex != -1 && endIndex != -1)
-                ? baseVersion.Substring(startIndex, endIndex - startIndex)
-                : "UnknownVersion";
+                return (startIndex != -1 && endIndex != -1)
+                    ? baseVersion.Substring(startIndex, endIndex - startIndex)
+                    : "UnknownVersion";
+            }
+            catch (Exception ex)
+            {
+                string errorMsg = "Error al extraer la versión de SOLIDWORKS: " + ex.Message;
+                LogToFile(errorMsg);  // Log error
+                Debug.Print(errorMsg);
+                LogToFile(errorMsg);
+                return "UnknownVersion";
+            }
         }
 
-        private void UploadIfExists(string directory, string fileName)
+        private async Task UploadIfExists(string directory, string fileName)
         {
-            DateTime date = new DateTime();
-            string filePath = Path.Combine(directory, fileName, date.ToString());
-            if (File.Exists(filePath))
+            try
             {
-                UploadToS3(filePath, fileName);
-            } 
+                // DateTime date = new DateTime();
+                string filePath = Path.Combine(directory, fileName);
+                LogToFile("mando llamar al upload" + filePath);
+                if (File.Exists(filePath))
+                {
+                    await UploadToS3(filePath, fileName);
+                } else
+                {
+                    LogToFile("Archivo no existe: " + filePath);
+                }
+            }
+            catch (Exception ex)
+            {
+                string errorMsg = "Error al subir archivo si existe: " + ex.Message;
+                LogToFile(errorMsg);  // Log error
+                Debug.Print(errorMsg);
+                LogToFile(errorMsg);
+            }
         }
 
         private async Task UploadToS3(string filePath, string fileKeyName)
         {
-            string bucketName = "dev-nc-swapp";
-            string userId = GetUserID();
-            string customerId = GetCustomerID();
-            DateTime date = new DateTime();
-            string keyName = $"{customerId}/{userId}/{fileKeyName}/{date}";
-            // Encriptar el keyName
-            string encryptionKey = "dT7eY93vKLO82n9/ZPiC1m0HKoA9f5FZ6+dx6E5m7PA="; // asegúrate de tener una clave de 32 caracteres
-            string encryptedKeyName = EncryptString(keyName, encryptionKey);
-            Debug.Print($"Subiendo archivo a S3: {filePath}");
-
             try
             {
-                // Usar SharedCredentialsFile para obtener las credenciales del perfil 'default'
+                string bucketName = "dev-nc-swapp";
+                string userId = GetUserID();
+                string customerId = GetCustomerID();
+                DateTime date = DateTime.Now;
+
+                // Crear carpeta temporal si no existe
+                if (!Directory.Exists(tempFolder))
+                    Directory.CreateDirectory(tempFolder);
+
+                // Crear ruta del archivo temporal
+                string tempFilePath = Path.Combine(tempFolder, Path.GetFileName(filePath));
+
+                // Copiar el archivo a la carpeta temporal
+                File.Copy(filePath, tempFilePath, true);
+
+                // Encriptar los valores
+                string encryptionKey = "dT7eY93vKLO82n90ZPiC1m0HKoA9f5FZ6+dx6E5m7PA=";
+                string userIdEncryption = EncryptString(userId, encryptionKey).Replace("/", "0");
+                string customerIdEncryption = EncryptString(customerId, encryptionKey).Replace("/", "0");
+                string fileKeyNameEncryption = EncryptString(fileKeyName, encryptionKey).Replace("/", "0");
+                string fecha = date.ToString().Replace("/", "-");
+                string keyName = $"{customerId}/{userId}/{fileKeyName}/{fecha}/{fileKeyName}";
+                string encryptedKeyName = $"{customerIdEncryption}/{userIdEncryption}/{fileKeyNameEncryption}/{fecha}/{fileKeyName}";
+
+                Debug.Print($"Subiendo archivo a S3: {tempFilePath}");
+
                 var chain = new CredentialProfileStoreChain();
                 AWSCredentials credentials;
 
                 if (!chain.TryGetAWSCredentials("default", out credentials))
                 {
+                    LogToFile("No se pudieron obtener las credenciales de AWS.");
                     throw new Exception("No se pudieron obtener las credenciales de AWS.");
                 }
 
                 using (var s3Client = new AmazonS3Client(credentials, RegionEndpoint.USEast1))
                 using (var fileTransferUtility = new TransferUtility(s3Client))
                 {
-                    fileTransferUtility.Upload(filePath, bucketName, encryptedKeyName);
+                    fileTransferUtility.Upload(tempFilePath, bucketName, encryptedKeyName);
                     Debug.Print("Archivo subido correctamente a AWS S3.");
+                    LogToFile("Archivo subido correctamente a AWS S3.");
                     await InsertLogs(keyName);
                 }
             }
             catch (AmazonS3Exception e)
             {
-                Debug.Print($"Error en AWS S3: {e.Message}");
+                string errorMsg = $"Error en AWS S3: {e.Message}";
+                LogToFile(errorMsg);
+                Debug.Print(errorMsg);
             }
             catch (Exception e)
             {
-                Debug.Print($"Error desconocido: {e.Message}");
+                string errorMsg = $"Error desconocido en UploadToS3: {e.Message}";
+                LogToFile(errorMsg);
+                Debug.Print(errorMsg);
+            }
+            finally
+            {
+                // Borrar carpeta temporal completa
+                try
+                {
+                    if (Directory.Exists(tempFolder))
+                        Directory.Delete(tempFolder, true);
+                }
+                catch (Exception ex)
+                {
+                    LogToFile("Error al eliminar la carpeta temporal: " + ex.Message);
+                }
             }
         }
 
         public async Task InsertLogs(string FilesLogs)
         {
-            string token = await GetToken(TOKEN_Analitics_URL);
-
-            if (string.IsNullOrEmpty(token))
+            try
             {
-                Debug.Print("Error: No se pudo obtener el token.");
-                return;
+                // Obtener el token de autenticación
+                string token = await GetToken(TOKEN_Analitics_URL);
+
+                if (string.IsNullOrEmpty(token))
+                {
+                    string errorMsg = "Error: No se pudo obtener el token.";
+                    LogToFile(errorMsg);  // Log error
+                    Debug.Print(errorMsg);
+                    LogToFile(errorMsg);
+                    return;
+                }
+
+                // Preparar la URL de la API
+                string url = "https://api-ncsw.xpertme.com/api/createLogs";  // URL de la API de logs
+
+                // Obtener los datos del dispositivo y usuario
+                string device = GetDeviceID();
+                string UserID = GetUserID();  // Asegúrate de que si UserID es null, sea manejado adecuadamente
+                string UserMail = GetEmail();  // Asegúrate de obtener el correo del usuario
+
+                // Preparar los datos de la solicitud
+                var Json = new
+                {
+                    code = "r5ncccmGhzLG",
+                    deviceID = device,
+                    UserID = (UserID == null ? (object)null : UserID),  // Si es null, pasamos un null explícito
+                    UserMail = UserMail,
+                    logList = new[]
+                    {
+                new { nameFile = FilesLogs }  // Aquí convertimos FilesLogs en un objeto con la propiedad nameFile
             }
+                };
 
-            string url = "https://api-ncsw.xpertme.com/api/createLogs";
-            string device = GetDeviceID();
-            string UserID = GetUserID();
-            var Json = new
-            {
-                code = "r5ncccmGhzLG",
-                deviceID = device,
-                UserID = UserID,
-                UserMail = 0,
-                logList = FilesLogs
-            };
+                // Serializar los datos en formato JSON
+                string requestBody = JsonConvert.SerializeObject(Json, Formatting.Indented);
 
-            string requestBody = JsonConvert.SerializeObject(Json, Formatting.Indented);
-            var request = new HttpRequestMessage(HttpMethod.Post, url);
-            
-            request.Headers.Add("Authorization", $"Bearer {token}");
+                // Crear la solicitud HTTP
+                var request = new HttpRequestMessage(HttpMethod.Post, url);
+                request.Headers.Add("Authorization", $"{token}");  // Añadir el token en el encabezado
+                request.Content = new StringContent(requestBody, Encoding.UTF8, "application/json");
 
-            request.Content = new StringContent(requestBody, Encoding.UTF8, "application/json");
+                // Enviar la solicitud
+                var response = await client.SendAsync(request);
 
-            var response = await client.SendAsync(request);
+                // Comprobar si la respuesta es exitosa
+                if (!response.IsSuccessStatusCode)
+                {
+                    string errorMsg = $"Error en la solicitud: {response.StatusCode} - {await response.Content.ReadAsStringAsync()}";
+                    LogToFile(errorMsg);  // Log error
+                    Debug.Print(errorMsg);
+                    LogToFile(errorMsg);
+                    return;
+                }
 
-            if (!response.IsSuccessStatusCode)
-            {
-                Debug.Print($"Error en la solicitud: {response.StatusCode} - {await response.Content.ReadAsStringAsync()}");
-                return;
+                // Procesar la respuesta de la API
+                string responseText = await response.Content.ReadAsStringAsync();
+                JObject jsonResponse = JObject.Parse(responseText);
+                Debug.Print(jsonResponse.ToString());
+                LogToFile(jsonResponse.ToString());
             }
-
-            string responseText = await response.Content.ReadAsStringAsync();
-            JObject jsonResponse = JObject.Parse(responseText);
-            Debug.Print(jsonResponse.ToString());
+            catch (Exception ex)
+            {
+                string errorMsg = "Error al insertar logs: " + ex.Message;
+                LogToFile(errorMsg);  // Log error
+                Debug.Print(errorMsg);
+                LogToFile(errorMsg);
+            }
         }
 
         private string EncryptString(string plainText, string key)
         {
-            byte[] iv = new byte[16];
-            byte[] array;
-
-            using (Aes aes = Aes.Create())
+            try
             {
-                aes.Key = Encoding.UTF8.GetBytes(key.PadRight(32).Substring(0, 32));
-                aes.IV = iv;
+                // Reemplazar las diagonales ("/") por "0"
+                plainText = plainText.Replace("/", "0");
 
-                ICryptoTransform encryptor = aes.CreateEncryptor(aes.Key, aes.IV);
+                byte[] iv = new byte[16];
+                byte[] array;
 
-                using (MemoryStream memoryStream = new MemoryStream())
+                using (Aes aes = Aes.Create())
                 {
-                    using (CryptoStream cryptoStream = new CryptoStream(memoryStream, encryptor, CryptoStreamMode.Write))
+                    aes.Key = Encoding.UTF8.GetBytes(key.PadRight(32).Substring(0, 32));
+                    aes.IV = iv;
+
+                    ICryptoTransform encryptor = aes.CreateEncryptor(aes.Key, aes.IV);
+
+                    using (MemoryStream memoryStream = new MemoryStream())
                     {
-                        using (StreamWriter streamWriter = new StreamWriter(cryptoStream))
+                        using (CryptoStream cryptoStream = new CryptoStream(memoryStream, encryptor, CryptoStreamMode.Write))
                         {
-                            streamWriter.Write(plainText);
+                            using (StreamWriter streamWriter = new StreamWriter(cryptoStream))
+                            {
+                                streamWriter.Write(plainText);
+                            }
+                            array = memoryStream.ToArray();
                         }
-                        array = memoryStream.ToArray();
                     }
                 }
-            }
 
-            return Convert.ToBase64String(array);
+                // Log de la cadena encriptada (en Base64)
+                string encryptedString = Convert.ToBase64String(array);
+                LogToFile(encryptedString);
+
+                return encryptedString;
+            }
+            catch (Exception ex)
+            {
+                string errorMsg = "Error al encriptar la cadena: " + ex.Message;
+                LogToFile(errorMsg);  // Log error
+                Debug.Print(errorMsg);
+                LogToFile(errorMsg);
+                return string.Empty;
+            }
         }
 
-        
     }
 }
