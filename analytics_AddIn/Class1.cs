@@ -31,8 +31,8 @@ namespace analytics_AddIn
 {
     [ComVisible(true)]
     [Guid("31b803e0-7a01-4841-a0de-895b726625c9")]
-    [DisplayName("Analitics")]
-    [Description("Analitics SOLIDWORKS Add-In")]
+    [DisplayName("Analytics")]
+    [Description("Analytics SOLIDWORKS Add-In")]
     public class Class1 : ISwAddin
     {
         [DllImport("shell32.dll", CharSet = CharSet.Auto)]
