@@ -597,7 +597,6 @@ namespace instalador
                     string responseText = await response.Content.ReadAsStringAsync();
                     JObject jsonObject = JObject.Parse(responseText);
                     string statusCustomer = jsonObject["data"]?["hasCustomer"]?.ToString();
-                    UserID = jsonObject["data"]?["ac_UserID"]?.ToString();
                     
                     customerMapping.Clear();
                     List<string> customerNames = new List<string>();
