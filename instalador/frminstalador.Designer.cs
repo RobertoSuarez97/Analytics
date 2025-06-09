@@ -25,6 +25,8 @@
 
         private void InitializeComponent()
         {
+            this.FormBorderStyle = System.Windows.Forms.FormBorderStyle.FixedSingle;
+            this.MaximizeBox = false;
             System.ComponentModel.ComponentResourceManager resources = new System.ComponentModel.ComponentResourceManager(typeof(frminstalador));
             this.lyrBienvenida = new System.Windows.Forms.Panel();
             this.imgXpertAnalitics = new System.Windows.Forms.PictureBox();

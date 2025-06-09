@@ -7,26 +7,34 @@ using System.Windows.Forms;
 using System.IO.Compression;
 using Microsoft.Win32;
 using System.Security.Principal;
+using System.Text;
+using System.Xml.Linq;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+using System.Collections.Generic;
+using System.Net;
+using System.Linq;
 
-namespace analytics_AddIn
+namespace updates
 {
-    public partial class update : Form
+    public partial class formUpdate : Form
     {
         private string temp = "";
-        public string versionActual { get; set; }
-        public string versionNueva { get; set; }
-        public string cambios { get; set; }
-        public string link { get; set; }
+        private const string API_Xpertme_URL = "https://api-academy.xpertcad.com/v2/analytics/users/getAnalyticsInstallers";
+        private const string TOKEN_Xpertme_URL = "https://api-academy.xpertcad.com/v2/system/oauth/token";
+        private static readonly HttpClient client = new HttpClient();
+        public string versionActual;
+        public string versionNueva;
+        public string cambios;
+        public string link;
         public string AppName = "analytics";
         private string LogFilePath = "";
 
 
-        public update()
+        public formUpdate()
         {
             InitializeComponent();
             this.Load += update_Load;
-            progressBar1.Visible = false;
-            
             // Verificar si ya hay otra instancia en ejecución durante la inicialización
             VerificarInstanciasMultiples();
         }
@@ -46,7 +54,7 @@ namespace analytics_AddIn
                     LogToFile($"Múltiples instancias detectadas ({processes.Length}). Verificando si cerrar esta instancia.", "WARNING");
 
                     // Verificar si alguna de las otras instancias tiene permisos de administrador
-                   // bool otraInstanciaAdmin = false;
+                    //bool otraInstanciaAdmin = false;
                     foreach (Process proc in processes)
                     {
                         if (proc.Id != currentProcess.Id)
@@ -111,13 +119,254 @@ namespace analytics_AddIn
             }
         }
 
-        private void update_Load(object sender, EventArgs e)
+        // Método para cargar el formulario - reemplaza el actual update_Load
+        private async void update_Load(object sender, EventArgs e)
         {
-            LogToFile("Inicializando formulario de actualización");
+            try
+            {
+                LogToFile("Inicializando formulario de actualización");
+
+                // Configurar la UI inicial con mensaje de cargando
+                lblVersionActual.Text = "Verificando versión actual...";
+                lbversion.Text = "Buscando actualizaciones...";
+                rtbcambios.Text = "Cargando información...";
+                progressBar1.Visible = true;
+                btnactualizar.Enabled = false;
+
+                if (IsInternetAvailable())
+                {
+                    LogToFile("Conexión a internet detectada. Verificando actualizaciones...", "INFO");
+
+                    try
+                    {
+                        // Determinar la versión actual del software instalado
+                        ObtenerVersionActual();
+
+                        // Buscar actualizaciones de forma asincrónica (usar await en lugar de Task.Run)
+                        await BuscarActualizaciones();
+
+                        // Actualizar la UI con los datos obtenidos
+                        ActualizarInterfazConDatos();
+
+                        LogToFile($"Verificación completada. Versión actual: {versionActual}, Nueva versión: {versionNueva}");
+                    }
+                    catch (Exception asyncEx)
+                    {
+                        LogToFile($"Error en tareas asincrónicas de conexión: {asyncEx.Message}\nStack Trace: {asyncEx.StackTrace}", "ERROR");
+                        // Actualizar la UI para mostrar el error
+                        ActualizarInterfazConError("Error al verificar actualizaciones. Intente nuevamente más tarde.");
+                    }
+                }
+                else
+                {
+                    LogToFile("No hay conexión a internet. No se verificarán actualizaciones.", "WARNING");
+                    ActualizarInterfazConError("No hay conexión a internet. Por favor, verifique su conexión e intente nuevamente.");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogToFile($"Error general en la carga del formulario: {ex.Message}", "ERROR");
+                ActualizarInterfazConError("Error al inicializar. Por favor, reinicie la aplicación.");
+            }
+        }
+
+        // Método para buscar actualizaciones de forma asincrónica
+        private async Task BuscarActualizaciones()
+        {
+            try
+            {
+                LogToFile("Iniciando verificación de actualizaciones...", "INFO");
+                string token = await GetToken(TOKEN_Xpertme_URL);
+
+                if (string.IsNullOrEmpty(token))
+                {
+                    LogToFile("No se pudo obtener el token para verificar actualizaciones", "ERROR");
+                    throw new Exception("No se pudo autenticar con el servidor de actualizaciones");
+                }
+
+                LogToFile("Token obtenido. Consultando información de la última versión...", "INFO");
+                var request = new HttpRequestMessage(HttpMethod.Post, API_Xpertme_URL);
+                request.Headers.Add("Authorization", $"Bearer {token}");
+                request.Content = new StringContent("{ \"mode\": \"dev\" }", Encoding.UTF8, "application/json");
+
+                LogToFile("Enviando solicitud de verificación de actualizaciones...", "INFO");
+                var response = await client.SendAsync(request);
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    LogToFile($"Error al verificar actualizaciones. Código: {response.StatusCode}", "ERROR");
+                    throw new Exception($"Error en la respuesta del servidor: {response.StatusCode}");
+                }
+
+                var responseBody = await response.Content.ReadAsStringAsync();
+                JObject jsonObject = JObject.Parse(responseBody);
+                var lastInstaller = jsonObject["data"]?["lastInstaller"];
+
+                if (lastInstaller == null)
+                {
+                    LogToFile("No se encontró información del último instalador en la respuesta", "WARNING");
+                    throw new Exception("Información de actualización no disponible");
+                }
+
+                versionNueva = lastInstaller["Version"]?.ToString();
+                cambios = lastInstaller["ReleaseNotes"]?.ToString();
+                link = lastInstaller["publicDllLink"]?.ToString();
+
+                if (string.IsNullOrEmpty(versionNueva))
+                {
+                    LogToFile("No se pudo obtener el número de versión", "WARNING");
+                    throw new Exception("Información de versión no disponible");
+                }
+
+                LogToFile($"Información de actualización obtenida: Versión {versionNueva}");
+            }
+            catch (HttpRequestException httpEx)
+            {
+                LogToFile($"Error de red al verificar actualizaciones: {httpEx.Message}", "ERROR");
+                throw new Exception("Error de conexión con el servidor de actualizaciones", httpEx);
+            }
+            catch (JsonException jsonEx)
+            {
+                LogToFile($"Error al procesar respuesta JSON: {jsonEx.Message}", "ERROR");
+                throw new Exception("Error al procesar la respuesta del servidor", jsonEx);
+            }
+            catch (Exception ex) when (!(ex is HttpRequestException || ex is JsonException))
+            {
+                LogToFile($"Error al verificar actualizaciones: {ex.Message}\nStack Trace: {ex.StackTrace}", "ERROR");
+                throw; // Re-lanzar la excepción para manejarla en el método de llamada
+            }
+        }
+
+        // Método para obtener la versión actual del software
+        private void ObtenerVersionActual()
+        {
+            try
+            {
+                // Obtener la versión del ejecutable actual
+                string rutaInstalacion = ObtenerRutaInstalacion();
+                string rutaEjecutable = Path.Combine(rutaInstalacion, "DLL\\" + AppName + "_AddIn.dll");
+
+                LogToFile($"Intentando obtener versión de: {rutaEjecutable}");
+                if (File.Exists(rutaEjecutable))
+                {
+                    LogToFile($"Archivo ENCONTRADO: {rutaEjecutable}");
+                    FileVersionInfo versionInfo = FileVersionInfo.GetVersionInfo(rutaEjecutable);
+                    versionActual = versionInfo.FileVersion ?? "Desconocida";
+                    LogToFile($"Versión leída de DLL: {versionActual}");
+                }
+                else
+                {
+                    LogToFile($"Archivo NO ENCONTRADO: {rutaEjecutable}");
+                    // Si no se encuentra el ejecutable, buscar en el mismo directorio que el actualizador
+                    string rutaActualizador = Application.ExecutablePath;
+                    string directorioActualizador = Path.GetDirectoryName(rutaActualizador);
+                    string ejecutableApp = Path.Combine(directorioActualizador, AppName + ".exe");
+
+                    LogToFile($"Intentando obtener versión de: {ejecutableApp}");
+                    if (File.Exists(ejecutableApp))
+                    {
+                        LogToFile($"Archivo ENCONTRADO: {ejecutableApp}");
+                        FileVersionInfo versionInfo = FileVersionInfo.GetVersionInfo(ejecutableApp);
+                        versionActual = versionInfo.FileVersion ?? "Desconocida";
+                        LogToFile($"Versión leída de EXE: {versionActual}");
+                    }
+                    else
+                    {
+                        versionActual = "No se pudo determinar";
+                    }
+                }
+
+                LogToFile($"Versión actual determinada: {versionActual}");
+            }
+            catch (Exception ex)
+            {
+                LogToFile($"Error al obtener versión actual: {ex.Message}", "ERROR");
+                versionActual = "Error al determinar versión";
+            }
+        }
+
+        // Método para actualizar la interfaz con los datos obtenidos
+        private void ActualizarInterfazConDatos()
+        {
+            // Verificar si estamos en el hilo correcto para modificar la UI
+            if (this.InvokeRequired)
+            {
+                this.Invoke(new Action(ActualizarInterfazConDatos));
+                return;
+            }
+
+            // Actualizar controles de la UI con los datos obtenidos
+            progressBar1.Visible = false;
             lblVersionActual.Text = $"Versión actual: {versionActual}";
             lbversion.Text = $"Nueva versión: {versionNueva}";
-            rtbcambios.Text = cambios;
-            LogToFile($"Versión actual: {versionActual}, Nueva versión: {versionNueva}");
+            rtbcambios.Text = cambios ?? "No hay información de cambios disponible";
+
+            // Habilitar botón de actualización solo si hay una versión más reciente
+            // (Aquí podrías agregar una comparación de versiones)
+            btnactualizar.Enabled = !string.IsNullOrEmpty(versionNueva);
+
+            // Opcionalmente, mostrar un mensaje si la versión es la misma
+            if (CompararVersiones(versionActual, versionNueva) >= 0)
+            {
+                MessageBox.Show("Ya tienes la última versión instalada.", "Actualización",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                this.Close();
+            }
+        }
+
+        // Método para actualizar la interfaz con un mensaje de error
+        private void ActualizarInterfazConError(string mensaje)
+        {
+            // Verificar si estamos en el hilo correcto para modificar la UI
+            if (this.InvokeRequired)
+            {
+                this.Invoke(new Action(() => ActualizarInterfazConError(mensaje)));
+                return;
+            }
+
+            // Actualizar controles de la UI para mostrar el error
+            progressBar1.Visible = false;
+            lblVersionActual.Text = $"Versión actual: {versionActual ?? "No determinada"}";
+            lbversion.Text = "Error al verificar actualizaciones";
+            rtbcambios.Text = mensaje;
+            btnactualizar.Enabled = false;
+        }
+
+        // Método para comparar versiones (devuelve >0 si v1>v2, 0 si iguales, <0 si v1<v2)
+        private int CompararVersiones(string v1, string v2)
+        {
+            try
+            {
+                // Si alguna versión es nula o vacía, manejar el caso
+                if (string.IsNullOrEmpty(v1) && string.IsNullOrEmpty(v2))
+                    return 0;
+                if (string.IsNullOrEmpty(v1))
+                    return -1;
+                if (string.IsNullOrEmpty(v2))
+                    return 1;
+
+                // Normalizar versiones (quitar caracteres no numéricos y dividir por puntos)
+                string[] parts1 = v1.Split('.');
+                string[] parts2 = v2.Split('.');
+
+                // Comparar parte por parte
+                int maxLength = Math.Max(parts1.Length, parts2.Length);
+                for (int i = 0; i < maxLength; i++)
+                {
+                    int num1 = i < parts1.Length ? int.TryParse(parts1[i], out num1) ? num1 : 0 : 0;
+                    int num2 = i < parts2.Length ? int.TryParse(parts2[i], out num2) ? num2 : 0 : 0;
+
+                    if (num1 != num2)
+                        return num1.CompareTo(num2);
+                }
+
+                return 0; // Versiones iguales
+            }
+            catch (Exception ex)
+            {
+                LogToFile($"Error al comparar versiones: {ex.Message}", "ERROR");
+                return 0; // En caso de error, considerarlas iguales
+            }
         }
 
         private async void btnactualizar_Click(object sender, EventArgs e)
@@ -187,7 +436,7 @@ namespace analytics_AddIn
 
                 // Cerrar SolidWorks primero para evitar bloqueos de archivos
                 LogToFile("Cerrando SolidWorks");
-                //CerrarSolidWorks();
+                CerrarSolidWorks();
                 progressBar1.Value = 10;
                 await Task.Delay(500);
 
@@ -326,6 +575,101 @@ namespace analytics_AddIn
                     LogToFile($"Error al restaurar: {exRestore.Message}", "ERROR");
                     Debug.WriteLine("Error al restaurar: " + exRestore.Message);
                 }
+            }
+        }
+
+        private bool IsInternetAvailable()
+        {
+            try
+            {
+                LogToFile("Verificando conexión a internet...", "INFO");
+                using (var client = new HttpClient())
+                {
+                    var response = client.GetAsync("https://www.google.com").Result;
+                    bool isAvailable = response.IsSuccessStatusCode;
+                    LogToFile($"Estado de conexión a internet: {(isAvailable ? "Disponible" : "No disponible")}", isAvailable ? "INFO" : "WARNING");
+                    return isAvailable;
+                }
+            }
+            catch (Exception ex)
+            {
+                LogToFile($"Error al verificar la conexión a internet: {ex.Message}", "ERROR");
+                return false;
+            }
+        }
+
+        private async Task<string> GetToken(string url, string requestBody = "")
+        {
+            string token = null;
+            try
+            {
+                LogToFile($"Obteniendo token desde la URL: {url}", "INFO");
+                ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+                var request = new HttpRequestMessage(HttpMethod.Post, url);
+
+                if (url == TOKEN_Xpertme_URL)
+                {
+                    request.Headers.Add("Authorization", "Basic YW5hbHl0aWNzX3N3OlRtMFF6QTlR");
+                    request.Content = new FormUrlEncodedContent(new[]
+                    {
+                new KeyValuePair<string, string>("grant_type", "client_credentials"),
+                new KeyValuePair<string, string>("scope", "analytics:installers:get")
+            });
+                    LogToFile("Preparando solicitud de token para Xpertme.", "DEBUG");
+                }
+                else if (!string.IsNullOrEmpty(requestBody))
+                {
+                    request.Content = new StringContent(requestBody, Encoding.UTF8, "application/json");
+                    LogToFile("Preparando solicitud de token con cuerpo JSON.", "DEBUG");
+                }
+
+                var response = await client.SendAsync(request);
+                string responseBody = await response.Content.ReadAsStringAsync();
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    string errorMsg = $"Error al obtener token (HTTP {response.StatusCode}): {responseBody}";
+                    LogToFile(errorMsg, "ERROR");
+                    Debug.Print(errorMsg);
+                    return null;
+                }
+
+                JObject jsonObject = JObject.Parse(responseBody);
+
+                token = jsonObject["token"]?.ToString() ?? jsonObject["accessToken"]?.ToString();
+
+                if (string.IsNullOrEmpty(token))
+                {
+                    string errorMsg = "Error: El token no se encontró en la respuesta.";
+                    LogToFile(errorMsg, "ERROR");
+                    Debug.Print(errorMsg);
+                    return null;
+                }
+
+                LogToFile("Token obtenido correctamente.", "INFO");
+                Debug.Print("Token obtenido correctamente.");
+                return token;
+            }
+            catch (HttpRequestException httpEx)
+            {
+                string errorMsg = "Error HTTP en GetToken: " + httpEx.Message;
+                LogToFile(errorMsg, "ERROR");
+                Debug.Print(errorMsg);
+                return null;
+            }
+            catch (JsonException jsonEx)
+            {
+                string errorMsg = "Error al procesar JSON en GetToken: " + jsonEx.Message;
+                LogToFile(errorMsg, "ERROR");
+                Debug.Print(errorMsg);
+                return null;
+            }
+            catch (Exception ex)
+            {
+                string errorMsg = "Error general en GetToken: " + ex.Message;
+                LogToFile(errorMsg, "ERROR");
+                Debug.Print(errorMsg);
+                return null;
             }
         }
 

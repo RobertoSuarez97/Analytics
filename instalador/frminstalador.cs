@@ -32,11 +32,12 @@ namespace instalador
         string ruta = "", pathToExe = "", temp = "";
         string VERSION = "", AssemblyVERSION = "", ARCHIVO = "", URL = "", LINK = "";
         // datos que se guardan
-        string email = "", password = "", UserID = "", deviceID = "", deviceAlias = "", deviceName = "", code = "", osVersion = "", productName = "", deviceMAC = "", swActivies = "", career = "", campus = "";
+        string email = "", password = "", UserID = "", deviceID = "", deviceAlias = "", deviceName = "", code = "", osVersion = "", deviceMAC = "", swActivies = "", campus = "";
         string mode = "dev";
         string DllAddIn = "analytics_AddIn";
         private Dictionary<string, int> customerMapping = new Dictionary<string, int>();
         private int selectedCustomerID = 0; // Aquí guardarás el CustomerID del seleccionado
+        private string LogFilePath = GetSource() + "\\" + AppName + "\\Instalador_log.txt";
 
         public frminstalador()
         {
@@ -477,6 +478,7 @@ namespace instalador
                 JObject jsonObject = JObject.Parse(response);
                 this.LINK = jsonObject["data"]?["lastInstaller"]?["publicDllLink"]?.ToString();
                 this.VERSION = jsonObject["data"]?["lastInstaller"]?["Version"]?.ToString();
+                Text = $"Instalación Xpertme Analytics {VERSION}";
             }
             else
             {
@@ -490,7 +492,7 @@ namespace instalador
             System.Diagnostics.FileVersionInfo fvi = System.Diagnostics.FileVersionInfo.GetVersionInfo(assembly.Location);
             this.AssemblyVERSION = fvi.FileVersion;
             lbversion.Text = AssemblyVERSION;
-            Text = $"Instalación Xpertme Analytics {AssemblyVERSION}";
+            
         }
 
         public static async Task<string> getAnalyticsInstallers(string token)
@@ -597,7 +599,15 @@ namespace instalador
                     string responseText = await response.Content.ReadAsStringAsync();
                     JObject jsonObject = JObject.Parse(responseText);
                     string statusCustomer = jsonObject["data"]?["hasCustomer"]?.ToString();
-                    
+
+                    LogToFile(jsonObject.ToString(Newtonsoft.Json.Formatting.None));
+
+                    if (string.IsNullOrEmpty(statusCustomer))
+                    {
+                        return "0"; // No existe hasCustomer → 0
+                    }
+
+                    UserID = jsonObject["data"]?["ac_UserID"]?.ToString();
                     customerMapping.Clear();
                     List<string> customerNames = new List<string>();
                     foreach (var customer in jsonObject["data"]["customersInfo"])
@@ -665,6 +675,7 @@ namespace instalador
                 }
             }
         }
+       
 
         /////////////////////////////////////////////////////////////////////------------Create device-----------///////////////////////////////////////////////////////////////////////
         public static async Task<string> createDevice(string json)
@@ -887,6 +898,62 @@ namespace instalador
             Directory.Delete(ruta);
         }
 
+        public void LogToFile(string message, string level = "INFO")
+        {
+            try
+            {
+                string timeStamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+                string logEntry = "";
+                if (level.ToUpper() == "ERROR")
+                {
+                    logEntry = $@"
+                        [---------------------------- ERROR ----------------------------]
+                        Fecha: {timeStamp}
+                        Mensaje: {message}
+                        [--------------------------------------------------------------]";
+                }
+                else
+                {
+                    logEntry = $"{timeStamp} [{level}] - {message}";
+                }
+                using (StreamWriter writer = new StreamWriter(LogFilePath, true))
+                {
+                    writer.WriteLine(logEntry);
+                }
+            }
+            catch
+            {
+                Debug.Print("Error al escribir en el log.");
+            }
+        }
+        private static string GetSource()
+        {
+            string defaultSource = @"C:\ProgramData\SOLIDWORKS\analytics"; // Ruta por defecto
+            string source = null; // Inicialmente nulo
 
+            try
+            {
+                RegistryKey key = Registry.LocalMachine.OpenSubKey("SYSTEM\\CurrentControlSet\\Control\\ComputerName\\ComputerName");
+                if (key != null)
+                {
+                    object o = key.GetValue("Source");
+                    if (o != null)
+                    {
+                        source = o.ToString();
+                    }
+                    key.Close(); 
+                }
+            }
+            catch (Exception e)
+            {
+                Debug.Print("Error al obtener el valor 'Source' del Registro: " + e.ToString());
+            }
+            if (string.IsNullOrEmpty(source))
+            {
+                source = defaultSource;
+            }
+
+            return source;
+        }
     }
 }
