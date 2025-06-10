@@ -223,7 +223,6 @@ namespace analytics_AddIn
                 }
 
                 LogToFile("Verificando archivo de configuración...", "INFO");
-                HandleSolidWorksSessionStart();
 
                 LogToFile("Conexión con SOLIDWORKS completada con éxito", "INFO");
                 return true;
