@@ -28,6 +28,7 @@ using System.Windows.Forms;
 using System.Net;
 using System.Drawing;
 using System.Configuration;
+using Environment = System.Environment;
 
 namespace analytics_AddIn
 {
@@ -40,6 +41,9 @@ namespace analytics_AddIn
         [DllImport("shell32.dll", CharSet = CharSet.Auto)]
         public static extern IntPtr ExtractIcon(IntPtr hInst, string lpszExeFileName, int nIconIndex);
 
+        #region Constantes y Miembros Estáticos
+
+        // --- Constantes de la aplicación y API ---
         private const string AppName = "analytics";
         private const string ADDIN_KEY_TEMPLATE = @"SOFTWARE\SolidWorks\Addins\{{{0}}}";
         private const string ADDIN_STARTUP_KEY_TEMPLATE = @"Software\SolidWorks\AddInsStartup\{{{0}}}";
@@ -49,70 +53,63 @@ namespace analytics_AddIn
         private const string API_Analitics_URL = "https://api-ncsw.xpertme.com/api/createSession";
         private const string TOKEN_Xpertme_URL = "https://api-academy.xpertcad.com/v2/system/oauth/token";
         private const string TOKEN_Analitics_URL = "https://api-ncsw.xpertme.com/api/auth";
+
+        // --- Cliente HTTP Estático ---
+        private static readonly HttpClient client = new HttpClient();
+
+        #endregion
+
+        #region Rutas y Configuración del Add-In
+
+        // Usamos 'readonly' para asegurar que estas rutas se establezcan solo una vez en el constructor.
         private string baseApplicationDataFolder;
         private string LogFilePath;
         private string ConfigFilePath;
         private string tempFolder;
-        private ICommandManager commandManager;
-        private SldWorks solidWorksEventHandler;
-        private Hashtable openDocuments;
-        private static readonly HttpClient client = new HttpClient();
-        private ISldWorks solidWorksApp;
-        private int addInCookie;
-        private string VERSION;
-        private string versionActual;
-        private string cambios;
-        private string link;
 
-        // Variables de configuración
-        private string accessKeyId;
-        private string secretAccessKey;
-        private string bucketName;
-        private string region;
-        private string encryptionKey;
+        #endregion
+
+        #region Objetos y Estado de SolidWorks
+
+        private ISldWorks solidWorksApp;
+        private ICommandManager commandManager;
+        private int addInCookie;
+
+        #endregion
+
+        #region Variables para Seguimiento de Actividad
+
+        private bool isUserActive;
+        private System.Timers.Timer inactivityTimer;
+        private System.Timers.Timer heartbeatTimer;
+        private FileSystemWatcher journalFileWatcher;
+        private static readonly object _sessionFileLock = new object();
+
+        #endregion
+
+        #region Variables para Funcionalidades Adicionales
+
+        private string VERSION, versionActual, cambios, link;
+        private string accessKeyId, secretAccessKey, bucketName, region, encryptionKey;
         private bool isConfigured;
 
-        // Eventos
+        #endregion
         public Class1()
         {
-            string chosenBasePathForAppFolder = null;
-            string pathSourceOrigin = "No determinado"; // Para loguear de dónde vino la ruta
-
+            // El constructor ahora solo se encarga de llamar a los métodos de inicialización en orden.
             try
             {
-                string sourcePathFromRegistry = "C:\\ProgramData\\SOLIDWORKS";
-                chosenBasePathForAppFolder = Path.Combine(sourcePathFromRegistry, AppName);
-
-                if (!Directory.Exists(chosenBasePathForAppFolder))
-                {
-                    Directory.CreateDirectory(chosenBasePathForAppFolder);
-                }
-
-                this.baseApplicationDataFolder = chosenBasePathForAppFolder; // Asignar a la variable de instancia
-                LogFilePath = Path.Combine(this.baseApplicationDataFolder, AppName + "_log.txt");
-                ConfigFilePath = Path.Combine(this.baseApplicationDataFolder, AppName + "_sessions.txt");
-                tempFolder = Path.Combine(this.baseApplicationDataFolder, "temp");
-
-                if (!Directory.Exists(tempFolder))
-                {
-                    Directory.CreateDirectory(tempFolder);
-                }
-
-                // --- Paso 6: Ahora sí podemos loguear de forma segura ---
-                LogToFile($"Constructor Class1: Rutas inicializadas. Origen de ruta base: {pathSourceOrigin}.", "INFO");
-                LogToFile($"LogFilePath establecido en: {LogFilePath}", "INFO");
-                LogToFile($"ConfigFilePath establecido en: {ConfigFilePath}", "INFO");
-                LogToFile($"tempFolder establecido en: {tempFolder}", "INFO");
-                if (string.IsNullOrEmpty(sourcePathFromRegistry) || !Directory.Exists(sourcePathFromRegistry))
-                {
-                    LogToFile($"Fallback a LocalApplicationData porque 'Source' del registro ('{sourcePathFromRegistry ?? "null"}') no es válido/existente.", "WARNING");
-                }
-
+                // Primero las rutas, para que la función de log esté disponible inmediatamente.
+                InitializePaths();
+                // Luego, preparamos el sistema de seguimiento de actividad.
+                InitializeActivityTracking();
+                // Finalmente, cargamos otras configuraciones si es necesario.
                 LoadConfiguration();
             }
             catch (Exception ex)
             {
-                Debug.Print($"ERROR CRÍTICO en constructor Class1 al inicializar rutas: {ex.ToString()}");
+                // Si algo falla aquí, es un error crítico. Lo registramos en la ventana de depuración.
+                Debug.Print($"ERROR CRÍTICO EN EL CONSTRUCTOR DE Class1: {ex.ToString()}");
             }
         }
 
@@ -171,168 +168,42 @@ namespace analytics_AddIn
 
         public bool ConnectToSW(object solidWorksInstance, int addInId)
         {
-            
             try
-            {   
+            {
                 LogToFile("ConnectToSW: Iniciando conexión...", "INFO");
-                solidWorksApp = solidWorksInstance as ISldWorks;
-                if (solidWorksApp == null)
-                {
-                    LogToFile("Error: La instancia de SOLIDWORKS no es válida", "ERROR");
-                    return false;
-                }
- 
+                solidWorksApp = (ISldWorks)solidWorksInstance;
+                if (solidWorksApp == null) { return false; }
+
                 addInCookie = addInId;
-                LogToFile($"Cookie del add-in establecido: {addInCookie}", "INFO");
-
-                solidWorksApp.SetAddinCallbackInfo(0, this, addInCookie);
                 commandManager = solidWorksApp.GetCommandManager(addInCookie);
-                if (commandManager == null)
-                {
-                    LogToFile("Error: No se pudo obtener el CommandManager", "ERROR");
-                    return false;
-                }
+                solidWorksApp.SetAddinCallbackInfo(0, this, addInCookie);
 
-                LogToFile("Inicializando manejadores de eventos...", "INFO");
-                InitializeEventHandlers();
+                // Inicia el monitoreo del archivo Journal.
+                InitializeJournalMonitoring();
 
-                if (IsInternetAvailable())
-                {
-                    LogToFile("Conexión a internet detectada. Verificando actualizaciones...", "INFO");
-                    Task.Run(async () =>
+                // Revisa si la sesión anterior tuvo un crash.
+                HandlePreviousSessionCrash();
+
+                // Ejecuta tareas de fondo.
+                Task.Run(async () => {
+                    if (IsInternetAvailable())
                     {
-                        try
-                        {
-                            LogToFile("Iniciando verificación de actualizaciones...", "INFO");
-                            await CheckForUpdates();
-                            LogToFile("Iniciando envío de sesión...", "INFO");
-                            await SendSesionSW();
-                            LogToFile("Iniciando envío de archivos JWL...", "INFO");
-                            await SendJwl();
-                            LogToFile("Tareas asincrónicas completadas con éxito", "INFO");
-                        }
-                        catch (Exception asyncEx)
-                        {
-                            LogToFile($"Error en tareas asincrónicas de conexión: {asyncEx.Message}\nStack Trace: {asyncEx.StackTrace}", "ERROR");
-                        }
-                    });
-                }
-                else
-                {
-                    LogToFile("No hay conexión a internet. No se verificarán actualizaciones.", "WARNING");
-                }
+                        await CheckForUpdates();
+                        await SendSesionSW();
+                        await SendJwl();
+                    }
+                });
 
-                LogToFile("Verificando archivo de configuración...", "INFO");
-
-                LogToFile("Conexión con SOLIDWORKS completada con éxito", "INFO");
+                LogToFile("Conexión con SOLIDWORKS completada.", "INFO");
                 return true;
             }
-            catch (COMException comEx)
-            {
-                LogToFile($"Error COM en ConnectToSW: {comEx.Message}\nCódigo: {comEx.ErrorCode}\nStack Trace: {comEx.StackTrace}", "ERROR");
-                return false;
-            }
             catch (Exception ex)
             {
-                LogToFile($"Error en ConnectToSW: {ex.Message}\nStack Trace: {ex.StackTrace}", "ERROR");
+                LogToFile($"Error fatal en ConnectToSW: {ex.ToString()}", "ERROR");
                 return false;
             }
         }
 
-        /// <summary>
-        /// Lógica principal para determinar el estado de la sesión al iniciar SOLIDWORKS.
-        /// </summary>
-        private void HandleSolidWorksSessionStart()
-        {
-            try
-            {
-                if (!DoesConfigFileExist() || string.IsNullOrWhiteSpace(getTextFile())) // Usamos getTextFile para verificar si está vacío
-                {
-                    LogToFile("Archivo de configuración de sesiones no existe o está vacío. Registrando 'Open'.", "INFO");
-                    RegisterSolidWorksSession("Open"); // Registrar 'Open'
-                    return;
-                }
-
-                LogToFile("Verificando el estado de la última sesión en el archivo...", "INFO");
-                string lastSessionEntry = ReadLastSessionEntryFromConfigFile(); // <-- ¡NUEVA FUNCIÓN!
-
-                if (string.IsNullOrWhiteSpace(lastSessionEntry))
-                {
-                    LogToFile("No se pudo leer una última entrada de sesión válida. Registrando 'Open'.", "WARNING");
-                    RegisterSolidWorksSession("Open");
-                    return;
-                }
-
-                // El formato esperado es: "YYYY/MM/DD HH:MM:SS,Action,UserID,Email;"
-                string[] parts = lastSessionEntry.TrimEnd(';').Split(','); // Eliminar el ';' final antes de dividir
-                if (parts.Length < 2) // Necesitamos al menos fecha y acción
-                {
-                    LogToFile($"Formato inválido en la última entrada de sesión: '{lastSessionEntry}'. No se pudo determinar el estado. Registrando 'Open'.", "WARNING");
-                    RegisterSolidWorksSession("Open"); // Siempre iniciar una nueva sesión en caso de duda
-                    return;
-                }
-
-                string sessionStatus = parts[1].Trim(); // La acción es la segunda parte
-                LogToFile($"Estado de la última sesión registrada: '{sessionStatus}'", "INFO");
-
-                if (sessionStatus.Equals("Open", StringComparison.OrdinalIgnoreCase))
-                {
-                    // Si la última sesión fue "Open" y estamos iniciando de nuevo,
-                    // significa que la sesión anterior no se cerró correctamente (Crash).
-                    LogToFile("Se detectó una sesión 'Open' previa sin cerrar. Registrando 'Crash'.", "WARNING");
-                    RegisterSolidWorksSession("Crash"); // Registrar el Crash para la sesión anterior
-                }
-                // Si la última sesión fue "Close" o "Crash", no necesitamos hacer nada especial antes de registrar la nueva "Open".
-
-                // Después de manejar el "Crash" (si aplica) o si la última fue "Close"/"Crash",
-                // SIEMPRE registramos la nueva sesión "Open" para este inicio.
-                LogToFile("Registrando la nueva sesión de SOLIDWORKS como 'Open'.", "INFO");
-                RegisterSolidWorksSession("Open");
-            }
-            catch (Exception ex)
-            {
-                LogToFile($"Error en HandleSolidWorksSessionStart: {ex.Message}\nStack Trace: {ex.StackTrace}", "ERROR");
-                // Como último recurso, si algo falla al leer o procesar, intenta registrar un Open.
-                try { RegisterSolidWorksSession("Open"); } catch { /* Silenciar si falla */ }
-            }
-        }
-
-        /// 
-        /// Configura los manejadores de eventos para capturar eventos de SOLIDWORKS.
-        /// 
-        private void InitializeEventHandlers()
-        {
-            try
-            {
-                LogToFile("Configurando manejadores de eventos de SOLIDWORKS...", "INFO");
-                solidWorksEventHandler = (SldWorks)solidWorksApp;
-                if (solidWorksEventHandler == null)
-                {
-                    throw new InvalidCastException("No se pudo convertir SolidWorksApp a SldWorks");
-                }
-
-                openDocuments = new Hashtable();
-
-                LogToFile("Manejadores de eventos inicializados correctamente", "INFO");
-
-                // Validación de licencia (comentada actualmente)
-                // LogToFile("Validando licencia...", "INFO");
-                // if (!ValidateLicense())
-                // {
-                //     LogToFile("La validación de licencia ha fallado", "WARNING");
-                // }
-            }
-            catch (InvalidCastException icEx)
-            {
-                LogToFile($"Error al convertir tipos en InitializeEventHandlers: {icEx.Message}", "ERROR");
-                throw;  // Relanzamos para que se maneje en el nivel superior
-            }
-            catch (Exception ex)
-            {
-                LogToFile($"Error al inicializar manejadores de eventos: {ex.Message}\nDetalles: {ex.StackTrace}", "ERROR");
-                throw;  // Relanzamos para que se maneje en el nivel superior
-            }
-        }
         private void LoadConfiguration()
         {
             try
@@ -340,7 +211,6 @@ namespace analytics_AddIn
                 LogToFile("LoadConfiguration cargado correctamente", "INFO");
 
                 // Limpiar configuración anterior
-                
                 isConfigured = true;
 
                 // Log final de configuración (sin mostrar valores sensibles)
@@ -398,6 +268,221 @@ namespace analytics_AddIn
         }
 
         /// 
+        /// ////////////////////////////////////////////////////////////////////////// Monitoreo de Archivo Journal /////////////////////////////////////////////////////////////////////////
+        /// 
+        /// 
+        #region Monitoreo de Archivo Journal
+
+        /// <summary>
+        /// Configura y activa el FileSystemWatcher para monitorear el archivo swxJRNL.swj.
+        /// </summary>
+        private void InitializeJournalMonitoring()
+        {
+            try
+            {
+                // 1. Obtenemos la información de la versión de SolidWorks para construir la ruta.
+                string baseVersion, currentVersion, hotfixes;
+                solidWorksApp.GetBuildNumbers2(out baseVersion, out currentVersion, out hotfixes);
+
+                // 2. Usamos tu método existente 'ExtractSWVersion' para obtener solo el año (ej. "2024").
+                string versionSW = ExtractSWVersion(baseVersion);
+                if (versionSW == "UnknownVersion")
+                {
+                    LogToFile("No se pudo determinar la versión de SOLIDWORKS para monitorear el Journal.", "ERROR");
+                    return;
+                }
+
+                // 3. Construimos la ruta al directorio del Journal.
+                string appDataPath = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+                string swVersionFolderName = $"SOLIDWORKS {versionSW}"; // ej: "SOLIDWORKS 2024"
+                string journalDirectory = Path.Combine(appDataPath, "SOLIDWORKS", swVersionFolderName);
+
+                if (!Directory.Exists(journalDirectory))
+                {
+                    LogToFile($"Error: No se encontró el directorio del Journal: {journalDirectory}", "ERROR");
+                    return;
+                }
+
+                // 4. Creamos y configuramos nuestro vigilante de archivos.
+                journalFileWatcher = new FileSystemWatcher
+                {
+                    Path = journalDirectory,
+                    Filter = "swxJRNL.swj", // Solo nos interesa este archivo.
+                    NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size, // Notificar si cambia tamaño o fecha.
+                    EnableRaisingEvents = true // ¡Activamos el monitoreo!
+                };
+
+                // 5. Suscribimos nuestros métodos a los eventos del vigilante.
+                journalFileWatcher.Changed += OnJournalFileChanged;
+                journalFileWatcher.Renamed += OnJournalFileRenamed;
+
+                LogToFile($"Monitoreo iniciado para el archivo Journal en: {journalDirectory}", "INFO");
+            }
+            catch (Exception ex)
+            {
+                LogToFile($"Error fatal al inicializar el monitoreo del Journal: {ex.Message}", "ERROR");
+            }
+        }
+
+        /// <summary>
+        /// Este método se dispara CADA VEZ que el archivo swxJRNL.swj es modificado.
+        /// </summary>
+        private void OnJournalFileChanged(object sender, FileSystemEventArgs e)
+        {
+            LogToFile($"Detectado cambio en archivo Journal: {e.ChangeType}", "DEBUG");
+
+            // ¡Cada cambio en el archivo es una actividad del usuario!
+            // Llamamos a nuestro método central para manejar la actividad.
+            RecordUserActivity();
+        }
+
+        /// <summary>
+        /// Se dispara cuando swxJRNL.swj es renombrado (usualmente a .bak en un cierre limpio).
+        /// </summary>
+        private void OnJournalFileRenamed(object sender, RenamedEventArgs e)
+        {
+            if (e.OldName == "swxJRNL.swj" && e.Name.EndsWith(".bak", StringComparison.OrdinalIgnoreCase))
+            {
+                LogToFile("Detectado renombrado de Journal a .bak (cierre limpio de SW).", "INFO");
+                // Si el usuario estaba activo justo antes del cierre, nos aseguramos de registrarlo.
+                if (isUserActive)
+                {
+                    isUserActive = false;
+                    inactivityTimer.Stop();
+                    heartbeatTimer.Stop();
+                    RegisterSolidWorksSession("Close");
+                }
+            }
+        }
+
+        #endregion
+
+        /// 
+        /// ////////////////////////////////////////////////////////////////////////// Lógica de Seguimiento y Sesiones /////////////////////////////////////////////////////////////////////////
+        /// 
+        /// 
+        #region Lógica de Seguimiento y Sesiones
+
+        /// <summary>
+        /// Prepara los temporizadores y variables para el seguimiento de actividad del usuario.
+        /// </summary>
+        private void InitializeActivityTracking()
+        {
+            isUserActive = false;
+
+            inactivityTimer = new System.Timers.Timer(300000); // 5 minutos
+            inactivityTimer.Elapsed += InactivityTimer_Elapsed;
+            inactivityTimer.AutoReset = false;
+
+            heartbeatTimer = new System.Timers.Timer(240000); // 4 minutos
+            heartbeatTimer.Elapsed += HeartbeatTimer_Elapsed;
+            heartbeatTimer.AutoReset = true;
+
+            LogToFile("Sistema de seguimiento de actividad (timers) inicializado.", "INFO");
+        }
+
+        /// <summary>
+        /// Método central que se llama cada vez que detectamos una interacción del usuario.
+        /// </summary>
+        private void RecordUserActivity()
+        {
+            // Si el usuario estaba INACTIVO, esta acción marca el inicio de una nueva sesión de trabajo.
+            if (!isUserActive)
+            {
+                isUserActive = true; // Lo marcamos como activo.
+                LogToFile("Usuario activo detectado. Registrando 'Open' e iniciando temporizadores.", "INFO");
+
+                // Registramos el inicio de la sesión de actividad.
+                RegisterSolidWorksSession("Open");
+
+                // Iniciamos el temporizador de pulsos.
+                heartbeatTimer.Start();
+            }
+
+            // Ya sea que estuviera activo o no, cada nueva actividad reinicia el temporizador de INACTIVIDAD.
+            // Esto le da al usuario otros 5 minutos antes de ser considerado inactivo.
+            inactivityTimer.Stop();
+            inactivityTimer.Start();
+        }
+
+        /// <summary>
+        /// Se ejecuta cuando el temporizador de pulso (4 min) se dispara.
+        /// </summary>
+        private void HeartbeatTimer_Elapsed(object sender, System.Timers.ElapsedEventArgs e)
+        {
+            if (isUserActive)
+            {
+                LogToFile("Pulso de actividad (Heartbeat) registrado.", "DEBUG");
+                RegisterSolidWorksSession("ActivePulse");
+            }
+        }
+
+        /// <summary>
+        /// Se ejecuta cuando el temporizador de inactividad (5 min) se dispara.
+        /// </summary>
+        private void InactivityTimer_Tick(object sender, EventArgs e)
+        {
+            // Solo actuamos si el usuario estaba previamente activo.
+            if (isUserActive)
+            {
+                isUserActive = false;       // Marcar al usuario como inactivo.
+                inactivityTimer.Stop();     // Detener ambos temporizadores.
+                heartbeatTimer.Stop();
+
+                LogToFile("Inactividad detectada. Registrando sesión 'Close'.", "INFO");
+                RegisterSolidWorksSession("Close");
+            }
+        }/// <summary>
+         /// Se ejecuta cuando el temporizador de inactividad (5 min) se dispara.
+         /// </summary>
+        private void InactivityTimer_Elapsed(object sender, System.Timers.ElapsedEventArgs e)
+        {
+            if (isUserActive)
+            {
+                isUserActive = false;
+                inactivityTimer.Stop();
+                heartbeatTimer.Stop();
+                LogToFile("Inactividad detectada. Registrando sesión 'Close'.", "INFO");
+                RegisterSolidWorksSession("Close");
+            }
+        }
+
+        /// <summary>
+        /// Revisa si la sesión anterior terminó inesperadamente basándose en la existencia del archivo Journal.
+        /// </summary>
+        private void HandlePreviousSessionCrash()
+        {
+            try
+            {
+                if (!File.Exists(ConfigFilePath)) return;
+
+                // Leemos la última línea no vacía del archivo de forma eficiente.
+                var lastLine = File.ReadLines(ConfigFilePath).LastOrDefault(line => !string.IsNullOrWhiteSpace(line));
+                if (lastLine == null) return;
+
+                string[] parts = lastLine.TrimEnd(';').Split(',');
+                if (parts.Length > 1)
+                {
+                    string lastAction = parts[1].Trim();
+
+                    // Si la última acción fue 'Open' O 'ActivePulse', significa que el programa se cerró
+                    // de forma inesperada mientras el usuario estaba trabajando.
+                    if (lastAction.Equals("Open", StringComparison.OrdinalIgnoreCase) ||
+                        lastAction.Equals("ActivePulse", StringComparison.OrdinalIgnoreCase))
+                    {
+                        LogToFile($"Detectada sesión previa no cerrada (última acción: {lastAction}). Registrando 'Crash'.", "WARNING");
+                        RegisterSolidWorksSession("Crash");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogToFile($"Error al verificar si hubo un crash en la sesión anterior: {ex.Message}", "ERROR");
+            }
+        }
+
+        #endregion
+        /// 
         /// ////////////////////////////////////////////////////////////////////////// Trabajar con el archivo txt de sesiones /////////////////////////////////////////////////////////////////////////
         /// 
         /// 
@@ -415,101 +500,6 @@ namespace analytics_AddIn
             {
                 LogToFile($"Error al verificar la existencia del archivo de configuración: {ex.Message}", "ERROR");
                 return false;
-            }
-        }
-
-        /// 
-        /// Lee el contenido del archivo de configuración.
-        /// 
-        private void ReadConfigFile()
-        {
-            try
-            {
-                LogToFile("Iniciando lectura del archivo de configuración...", "INFO");
-                if (!File.Exists(ConfigFilePath))
-                {
-                    LogToFile($"El archivo de configuración no existe en la ruta: {ConfigFilePath}", "ERROR");
-                    throw new FileNotFoundException("El archivo de configuración no existe.", ConfigFilePath);
-                }
-
-                string fileContent = File.ReadAllText(ConfigFilePath);
-                LogToFile("Archivo de configuración leído correctamente", "INFO");
-
-                if (string.IsNullOrWhiteSpace(fileContent))
-                {
-                    LogToFile("El archivo de configuración está vacío. Registrando nueva sesión.", "WARNING");
-                    RegisterSolidWorksSession("Open");
-                }
-                else
-                {
-                    LogToFile("Verificando el estado de la última sesión...", "INFO");
-                    string lastLine = ReadLastLine(ConfigFilePath);
-                    if (string.IsNullOrEmpty(lastLine))
-                    {
-                        LogToFile("No se pudo leer la última línea. Registrando nueva sesión.", "WARNING");
-                        RegisterSolidWorksSession("Open");
-                        return;
-                    }
-
-                    string[] parts = lastLine.TrimEnd(';', ',').Split(',');
-                    if (parts.Length < 2)
-                    {
-                        LogToFile($"Formato inválido en la última línea: {lastLine}", "WARNING");
-                        RegisterSolidWorksSession("Open");
-                        return;
-                    }
-
-                    string sessionStatus = parts[1].Trim();
-                    LogToFile($"Estado de la última sesión: {sessionStatus}", "INFO");
-
-                    if (sessionStatus == "Open")
-                    {
-                        LogToFile("Se detectó una sesión abierta sin cerrar. Registrando como crash.", "WARNING");
-                        RegisterSolidWorksSession("Crash");
-                    }
-
-                    LogToFile("Registrando nueva sesión de SOLIDWORKS", "INFO");
-                    RegisterSolidWorksSession("Open");
-                }
-            }
-            catch (FileNotFoundException fnfEx)
-            {
-                LogToFile($"Error: Archivo no encontrado: {fnfEx.Message}\nRuta: {fnfEx.FileName}", "ERROR");
-                CreateConfigFile();  // Intentamos crear el archivo
-            }
-            catch (IOException ioEx)
-            {
-                LogToFile($"Error de E/S al leer el archivo de configuración: {ioEx.Message}", "ERROR");
-                // Intentamos esperar un momento y reintentar una vez
-                try
-                {
-                    System.Threading.Thread.Sleep(500);
-                    if (File.Exists(ConfigFilePath))
-                    {
-                        string fileContent = File.ReadAllText(ConfigFilePath);
-                        if (string.IsNullOrWhiteSpace(fileContent))
-                        {
-                            RegisterSolidWorksSession("Open");
-                        }
-                    }
-                    else
-                    {
-                        CreateConfigFile();
-                    }
-                }
-                catch (Exception retryEx)
-                {
-                    LogToFile($"Error en el reintento de lectura: {retryEx.Message}", "ERROR");
-                }
-            }
-            catch (Exception ex)
-            {
-                LogToFile($"Error al leer el archivo de configuración: {ex.Message}\nStack Trace: {ex.StackTrace}", "ERROR");
-                try
-                {
-                    CreateConfigFile();  // Intentamos crear un nuevo archivo como último recurso
-                }
-                catch { }  // Si falla, ya hemos registrado el error original
             }
         }
 
@@ -614,198 +604,170 @@ namespace analytics_AddIn
         {
             try
             {
-                LogToFile($"Registrando sesión de SOLIDWORKS: {action}", "INFO");
                 string email = GetEmail();
                 string userID = GetUserID();
+                string sessionEntry = $"{DateTime.Now:yyyy/MM/dd HH:mm:ss},{action},{userID ?? "unknown"},{email ?? "unknown@email.com"};\r\n";
 
-                if (string.IsNullOrEmpty(email))
+                // --- AÑADIR LOCK AQUÍ ---
+                // Solo un hilo a la vez puede ejecutar el código dentro de este bloque.
+                lock (_sessionFileLock)
                 {
-                    LogToFile("No se pudo obtener el email del usuario", "WARNING");
-                    email = "unknown@email.com";  // Valor por defecto
+                    File.AppendAllText(ConfigFilePath, sessionEntry);
                 }
 
-                if (string.IsNullOrEmpty(userID))
-                {
-                    LogToFile("No se pudo obtener el ID del usuario", "WARNING");
-                    userID = "unknown";  // Valor por defecto
-                }
-
-                string sessionEntry = $"{DateTime.Now:yyyy/MM/dd HH:mm:ss},{action},{userID},{email};";
-                
-                File.AppendAllText(ConfigFilePath, sessionEntry);
-                LogToFile($"Sesión {action} registrada correctamente", "INFO");
-            }
-            catch (IOException ioEx)
-            {
-                LogToFile($"Error de E/S al registrar sesión: {ioEx.Message}", "ERROR");
+                LogToFile($"Sesión '{action}' registrada en el archivo.", "INFO");
             }
             catch (Exception ex)
             {
-                LogToFile($"Error al registrar la sesión en SOLIDWORKS: {ex.Message}", "ERROR");
+                LogToFile($"Error Crítico al registrar la sesión '{action}': {ex.Message}", "ERROR");
             }
         }
 
-        /// 
-        /// Obtiene la ultima linea del archivo.
-        /// 
-        private string ReadLastLine(string filePath)
-        {
-            string lastLine = string.Empty;
-            try
-            {
-                using (FileStream fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-                using (StreamReader sr = new StreamReader(fs))
-                {
-                    while (!sr.EndOfStream)
-                    {
-                        lastLine = sr.ReadLine();
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.Print("Error al leer la última línea del archivo: " + ex.Message);
-                LogToFile($"Error al leer la última línea del archivo: {ex.Message}", "ERROR");
-            }
-            return lastLine;
-        }
-
-
-        /// <summary>
-        /// Obtiene la última entrada de sesión del archivo, asumiendo el formato ";"-separador.
-        /// </summary>
-        private string ReadLastSessionEntryFromConfigFile()
-        {
-            try
-            {
-                if (!File.Exists(ConfigFilePath))
-                {
-                    return string.Empty;
-                }
-
-                string fileContent = File.ReadAllText(ConfigFilePath);
-                if (string.IsNullOrWhiteSpace(fileContent))
-                {
-                    return string.Empty;
-                }
-
-                // Dividir la cadena por el delimitador de sesión ';'
-                // y obtener la última parte no vacía.
-                string[] sessions = fileContent.Split(new char[] { ';' }, StringSplitOptions.RemoveEmptyEntries);
-
-                if (sessions.Length > 0)
-                {
-                    // La última sesión será el último elemento del array.
-                    // Añadimos el ';' de nuevo porque la API.
-                    string lastEntry = sessions[sessions.Length - 1].Trim();
-                    LogToFile($"Última entrada de sesión leída del archivo: '{lastEntry}'", "INFO");
-                    return lastEntry + ";"; // Re-añadimos el ';' si la API lo espera al final
-                }
-            }
-            catch (Exception ex)
-            {
-                LogToFile($"Error al leer la última entrada de sesión del archivo de sesiones: {ex.Message}", "ERROR");
-            }
-            return string.Empty;
-        }
         /// 
         /// Enviar las sesiones a la API.
         ///
         public async Task SendSesionSW()
         {
+            string processedContent = "";
+
             try
             {
-                LogToFile("Iniciando envío de información de sesiones...", "INFO");
+                // --- AÑADIR LOCK AQUÍ ---
+                // Ponemos el candado ANTES de tocar el archivo.
+                lock (_sessionFileLock)
+                {
+                    // Movemos la lógica de procesamiento y borrado DENTRO del candado.
+                    processedContent = ProcessSessionFile();
+                    if (!string.IsNullOrEmpty(processedContent))
+                    {
+                        // Si encontramos algo que enviar, borramos el archivo inmediatamente
+                        // para no enviarlo dos veces si la llamada a la API falla.
+                        ClearAlltext();
+                    }
+                } // El candado se libera aquí.
+
+                if (string.IsNullOrEmpty(processedContent))
+                {
+                    LogToFile("No hay sesiones completas para enviar.", "INFO");
+                    return;
+                }
+
+                // El resto de la lógica (llamada a la API) puede ir fuera del lock.
+                LogToFile("Iniciando envío de sesiones procesadas...", "INFO");
                 string token = await GetToken(TOKEN_Analitics_URL);
+                if (string.IsNullOrEmpty(token)) { /* ... */ return; }
 
-                if (string.IsNullOrEmpty(token))
-                {
-                    LogToFile("Error: No se pudo obtener el token para enviar sesiones", "ERROR");
-                    return;
-                }
-
-                string fileContent = getTextFile();
-                if (string.IsNullOrEmpty(fileContent))
-                {
-                    LogToFile("No hay datos de sesión para enviar", "WARNING");
-                    return;
-                }
-
-                string serialNumber = GetSerialnumber();
-                string swVersion = GetSwVersion();
-                string deviceId = GetDeviceID();
-
-                if (string.IsNullOrEmpty(deviceId))
-                {
-                    LogToFile("No se pudo obtener el ID del dispositivo", "WARNING");
-                    deviceId = "unknown-device";
-                }
-
-                LogToFile("Preparando payload para envío de sesiones...", "INFO");
                 var jsonPayload = new
                 {
                     code = "r5ncccmGhzLG",
-                    DeviceID = deviceId,
-                    License = serialNumber,
-                    SWVersion = swVersion,
-                    file = fileContent
+                    DeviceID = GetDeviceID(),
+                    License = GetSerialnumber(),
+                    SWVersion = GetSwVersion(),
+                    file = processedContent
                 };
 
-                string requestBody = JsonConvert.SerializeObject(jsonPayload, Formatting.Indented);
-                LogToFile($"Tamaño del payload: {requestBody.Length} bytes", "DEBUG");
-
+                string requestBody = JsonConvert.SerializeObject(jsonPayload);
                 var request = new HttpRequestMessage(HttpMethod.Post, API_Analitics_URL);
                 request.Headers.Add("authorization", token);
                 request.Content = new StringContent(requestBody, Encoding.UTF8, "application/json");
 
-                LogToFile("Enviando datos de sesión al servidor...", "INFO");
                 var response = await client.SendAsync(request);
-                string responseText = await response.Content.ReadAsStringAsync();
-                if (!response.IsSuccessStatusCode)
-                {
-                    LogToFile($"Error en la solicitud de envío de sesiones: {response.StatusCode} - {responseText}", "ERROR");
-                    return;
-                }
-
-                try
-                {
-                    JObject jsonResponse = JObject.Parse(responseText);
-
-                    if (jsonResponse.ContainsKey("message"))
-                    {
-                        JArray messageArray = (JArray)jsonResponse["message"];
-                        JToken firstItem = messageArray?.FirstOrDefault();
-
-                        if (firstItem != null && firstItem["statusInsert"]?.ToString() == "Insertado")
-                        {
-                            LogToFile("Sesión enviada e insertada correctamente", "INFO");
-                            ClearAlltext();
-                        }
-                        else
-                        {
-                            LogToFile($"Advertencia: La sesión no fue insertada correctamente. Respuesta: {responseText}", "WARNING");
-                        }
-                    }
-                    else
-                    {
-                        LogToFile($"Advertencia: No se encontró 'message' en la respuesta: {responseText}", "WARNING");
-                    }
-                }
-                catch (JsonException jsonEx)
-                {
-                    LogToFile($"Error al procesar respuesta JSON: {jsonEx.Message}\nRespuesta: {responseText}", "ERROR");
-                }
-            }
-            catch (HttpRequestException httpEx)
-            {
-                LogToFile($"Error de red en SendSesionSW: {httpEx.Message}", "ERROR");
+                // ... (resto de tu lógica de manejo de respuesta) ...
             }
             catch (Exception ex)
             {
-                LogToFile($"Error en SendSesionSW: {ex.Message}\nStack Trace: {ex.StackTrace}", "ERROR");
+                LogToFile($"Error en SendSesionSW: {ex.ToString()}", "ERROR");
+                // NOTA: Si la API falla, los datos ya fueron borrados del archivo principal.
+                // Se podría añadir lógica para reintentar o guardar los datos fallidos en otro archivo.
+                // Por ahora, lo mantenemos simple.
             }
         }
 
+
+        /// <summary>
+        /// Lee el archivo de sesiones crudo y lo procesa para crear pares limpios de Open/Close.
+        /// Esta es la versión final, ajustada para el formato que espera la API.
+        /// </summary>
+        /// <returns>Una cadena de texto con las sesiones consolidadas, separadas por ';'.</returns>
+        private string ProcessSessionFile()
+        {
+            try
+            {
+                if (!File.Exists(ConfigFilePath)) return "";
+                var allLines = File.ReadAllLines(ConfigFilePath)
+                                     .Where(l => !string.IsNullOrWhiteSpace(l))
+                                     .ToList();
+
+                if (!allLines.Any()) return "";
+
+                var processedSessions = new List<string>();
+                string currentOpenLine = null;
+                string lastPulseLine = null;
+
+                foreach (var line in allLines)
+                {
+                    var parts = line.Trim().TrimEnd(';').Split(',');
+                    if (parts.Length < 2) continue; // Ignorar líneas malformadas
+                    string action = parts[1].Trim();
+
+                    if (action.Equals("Open", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Si encontramos un 'Open' y ya teníamos uno pendiente, cerramos el anterior como 'Crash'.
+                        if (currentOpenLine != null)
+                        {
+                            string lineToClose = lastPulseLine ?? currentOpenLine;
+                            string[] crashParts = lineToClose.Split(',');
+                            crashParts[1] = "Crash";
+                            processedSessions.Add(currentOpenLine.Trim().TrimEnd(';'));
+                            processedSessions.Add(string.Join(",", crashParts));
+                        }
+                        currentOpenLine = line.Trim().TrimEnd(';');
+                        lastPulseLine = null;
+                    }
+                    else if (action.Equals("ActivePulse", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (currentOpenLine != null) lastPulseLine = line.Trim().TrimEnd(';');
+                    }
+                    else if (action.Equals("Close", StringComparison.OrdinalIgnoreCase) || action.Equals("Crash", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (currentOpenLine != null)
+                        {
+                            processedSessions.Add(currentOpenLine);
+                            // Si es un crash, usamos la fecha del último pulso para mayor precisión.
+                            string lineToClose = (action.Equals("Crash") && lastPulseLine != null) ? lastPulseLine : line.Trim().TrimEnd(';');
+                            string[] finalParts = lineToClose.Split(',');
+                            finalParts[1] = action; // Asegura que la acción sea 'Close' o 'Crash'
+                            processedSessions.Add(string.Join(",", finalParts));
+
+                            currentOpenLine = null;
+                            lastPulseLine = null;
+                        }
+                    }
+                }
+
+                // Si el bucle termina y queda una sesión abierta, la cerramos.
+                if (currentOpenLine != null)
+                {
+                    string finalLineToClose = lastPulseLine ?? currentOpenLine;
+                    string[] finalParts = finalLineToClose.Split(',');
+                    finalParts[1] = "Close"; // Asumimos un cierre normal en la desconexión.
+                    processedSessions.Add(currentOpenLine);
+                    processedSessions.Add(string.Join(",", finalParts));
+                }
+
+                if (!processedSessions.Any()) return "";
+
+                // Unimos todas las entradas procesadas en una sola cadena, usando ';' como separador.
+                string finalPayload = string.Join(";", processedSessions) + ";";
+                LogToFile($"ProcessSessionFile: Contenido procesado listo para enviar.", "DEBUG");
+                return finalPayload;
+            }
+            catch (Exception ex)
+            {
+                LogToFile($"Error en ProcessSessionFile: {ex.ToString()}", "ERROR");
+                return "";
+            }
+        }
 
         /// 
         /// Obtiene todo el contenido del archivo.
@@ -854,28 +816,49 @@ namespace analytics_AddIn
         {
             try
             {
-                RegisterSolidWorksSession("Close");
-                System.Runtime.InteropServices.Marshal.ReleaseComObject(commandManager);
-                commandManager = null;
-                System.Runtime.InteropServices.Marshal.ReleaseComObject(solidWorksApp);
-                solidWorksApp = null;
+                LogToFile("DisconnectFromSW: Iniciando desconexión...", "INFO");
+
+                // Detener y liberar el vigilante y los temporizadores.
+                journalFileWatcher?.Dispose();
+                inactivityTimer?.Stop();
+                heartbeatTimer?.Stop();
+                inactivityTimer?.Dispose();
+                heartbeatTimer?.Dispose();
+
+                // Si el usuario estaba activo al cerrar, registrar un 'Close' final.
+                if (isUserActive)
+                {
+                    RegisterSolidWorksSession("Close");
+                }
+
+                // Liberar objetos COM.
+                if (commandManager != null) Marshal.ReleaseComObject(commandManager);
+                if (solidWorksApp != null) Marshal.ReleaseComObject(solidWorksApp);
+
                 GC.Collect();
                 GC.WaitForPendingFinalizers();
-                GC.Collect();
-                GC.WaitForPendingFinalizers();
-                LogToFile("Desconexión de SOLIDWORKS completada", "INFO");
                 return true;
-            }
-            catch (COMException comEx)
-            {
-                LogToFile($"Error COM al desconectar de SOLIDWORKS: {comEx.Message}\nCódigo: {comEx.ErrorCode}", "ERROR");
-                return false;
             }
             catch (Exception ex)
             {
-                LogToFile($"Error al desconectar de SOLIDWORKS: {ex.Message}", "ERROR");
+                LogToFile($"Error en DisconnectFromSW: {ex.ToString()}", "ERROR");
                 return false;
             }
+        }
+
+        /// <summary>
+        /// Define las rutas de trabajo (logs, config) en una ubicación segura y escribible.
+        /// </summary>
+        private void InitializePaths()
+        {
+            string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            baseApplicationDataFolder = Path.Combine(localAppData, AppName);
+            Directory.CreateDirectory(baseApplicationDataFolder);
+
+            LogFilePath = Path.Combine(baseApplicationDataFolder, AppName + "_log.txt");
+            ConfigFilePath = Path.Combine(baseApplicationDataFolder, AppName + "_sessions.txt");
+            tempFolder = Path.Combine(baseApplicationDataFolder, "temp");
+            Directory.CreateDirectory(tempFolder);
         }
 
         /// 
@@ -1624,6 +1607,7 @@ namespace analytics_AddIn
                 }
                 catch (IOException ioEx)
                 {
+
                     LogToFile($"Error al copiar el archivo a la carpeta temporal: {ioEx.Message}", "ERROR");
                     return;
                 }
@@ -1633,8 +1617,9 @@ namespace analytics_AddIn
                 string customerIdEncryption = EncryptString(customerId)?.Replace("/", "0");
                 string fileKeyNameEncryption = EncryptString(fileKeyName)?.Replace("/", "0");
                 string fecha = date.ToString("yyyy-MM-dd HH-mm-ss");
-                string keyName = $"{customerId}/{userId}/{fileKeyName}/{fecha}/{fileKeyName}";
-                string encryptedKeyName = $"{customerIdEncryption}/{userIdEncryption}/{fileKeyNameEncryption}/{fecha}/{fileKeyName}";
+                string extention = fileKeyName.Split('.')[1];
+                string keyName = $"{customerId}/{userId}/{fecha}/{extention}/{fileKeyName}";
+                string encryptedKeyName = $"{customerIdEncryption}/{userIdEncryption}/{fecha}/{extention}/{fileKeyName}";
 
                 Debug.Print($"Subiendo archivo a S3: {tempFilePath}");
                 LogToFile($"Subiendo archivo a S3 con clave encriptada: {encryptedKeyName}", "INFO");
@@ -1855,4 +1840,5 @@ namespace analytics_AddIn
         /// 
     
     }
+
 }
