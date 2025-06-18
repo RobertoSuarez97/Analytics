@@ -53,6 +53,9 @@ namespace analytics_AddIn
         private const string API_Analitics_URL = "https://api-ncsw.xpertme.com/api/createSession";
         private const string TOKEN_Xpertme_URL = "https://api-academy.xpertcad.com/v2/system/oauth/token";
         private const string TOKEN_Analitics_URL = "https://api-ncsw.xpertme.com/api/auth";
+        private readonly string executionMode = "prod";
+
+        private bool testUpdate = false;
 
         // --- Cliente HTTP Estático ---
         private static readonly HttpClient client = new HttpClient();
@@ -74,6 +77,7 @@ namespace analytics_AddIn
         private ISldWorks solidWorksApp;
         private ICommandManager commandManager;
         private int addInCookie;
+        private bool backgroundTasksStarted = false;
 
         #endregion
 
@@ -178,6 +182,10 @@ namespace analytics_AddIn
                 commandManager = solidWorksApp.GetCommandManager(addInCookie);
                 solidWorksApp.SetAddinCallbackInfo(0, this, addInCookie);
 
+                ((SldWorks)solidWorksApp).OnIdleNotify += new DSldWorksEvents_OnIdleNotifyEventHandler(OnIdleNotifyHandler);
+
+                LogToFile("Suscripción al evento OnIdleNotify completada.", "INFO");
+
                 // Inicia el monitoreo del archivo Journal.
                 InitializeJournalMonitoring();
 
@@ -185,14 +193,14 @@ namespace analytics_AddIn
                 HandlePreviousSessionCrash();
 
                 // Ejecuta tareas de fondo.
-                Task.Run(async () => {
-                    if (IsInternetAvailable())
-                    {
-                        await CheckForUpdates();
-                        await SendSesionSW();
-                        await SendJwl();
-                    }
-                });
+                //Task.Run(async () => {
+                //    if (IsInternetAvailable())
+                //    {
+                //        await CheckForUpdates();
+                //        await SendSesionSW();
+                //        await SendJwl();
+                //    }
+                //});
 
                 LogToFile("Conexión con SOLIDWORKS completada.", "INFO");
                 return true;
@@ -211,7 +219,7 @@ namespace analytics_AddIn
                 LogToFile("LoadConfiguration cargado correctamente", "INFO");
 
                 // Limpiar configuración anterior
-                isConfigured = true;
+               
 
                 // Log final de configuración (sin mostrar valores sensibles)
                 LogToFile("-----------------Estado de configuración------------------", "INFO");
@@ -1204,7 +1212,17 @@ namespace analytics_AddIn
                 LogToFile("Token obtenido. Consultando información de la última versión...", "INFO");
                 var request = new HttpRequestMessage(HttpMethod.Post, API_Xpertme_URL);
                 request.Headers.Add("Authorization", $"Bearer {token}");
-                request.Content = new StringContent("{ \"mode\": \"dev\" }", Encoding.UTF8, "application/json");
+
+                // ---------------------------  EXECUTION MODE -----------------------------------------
+                // Creamos un objeto anónimo con nuestro modo dinámico.
+                var payload = new { mode = this.executionMode };
+
+                // Convertimos ese objeto a una cadena JSON de forma segura.
+                string jsonPayload = JsonConvert.SerializeObject(payload);
+
+                // Usamos la cadena JSON en el contenido de la petición.
+                request.Content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
+                // -------------------------------------------------------------------------------------
 
                 LogToFile("Enviando solicitud de verificación de actualizaciones...", "INFO");
                 var response = await client.SendAsync(request);
@@ -1225,9 +1243,19 @@ namespace analytics_AddIn
                     return;
                 }
 
-                VERSION = lastInstaller["Version"]?.ToString();
-                cambios = lastInstaller["ReleaseNotes"]?.ToString();
-                link = lastInstaller["publicDllLink"]?.ToString();
+                if (testUpdate) {
+                    VERSION = "1.0.4";
+                    cambios = "Test 1";
+                    link = "http://localhost/analytics/analytics-v1.0.4.zip";
+                }
+                else {
+                    VERSION = lastInstaller["Version"]?.ToString();
+                    cambios = lastInstaller["ReleaseNotes"]?.ToString();
+                    link = lastInstaller["publicDllLink"]?.ToString();
+                }
+
+
+
 
                 if (string.IsNullOrEmpty(VERSION))
                 {
@@ -1235,66 +1263,99 @@ namespace analytics_AddIn
                     return;
                 }
 
-                if (CompareVersions())
+                // =================================================================================
+                //  La lógica para lanzar el actualizador
+                // =================================================================================
+                if (CompareVersions()) // Si hay una nueva versión...
                 {
-                    LogToFile($"Nueva versión disponible detectada por Add-In: {this.VERSION}. Actual: {this.versionActual}. Lanzando actualizador externo.", "INFO");
+                    LogToFile($"Nueva versión {this.VERSION} detectada. Creando hoja de trabajo para el actualizador.", "INFO");
 
-                    string rutaInstalacion;
+                    // 1. Preparar la información en un objeto organizado.
+                    string rutaInstalacion = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location);
+                    rutaInstalacion = Path.Combine(GetSource(), AppName);
+
+                    var jobInfo = new UpdateJobInfo
+                    {
+                        TargetDirectory = rutaInstalacion,
+                        SourceUrl = this.link,
+                        NewVersion = this.VERSION,
+                        ReleaseNotes = this.cambios,
+                        ProcessToClose = "SLDWORKS"
+                    };
+
+                    // 2. Preparar el actualizador en la carpeta temporal (esto no cambia).
+                    string updaterOriginalPath = Path.Combine(rutaInstalacion, "updates.exe");
+                    LogToFile($"La ruta updaterOriginalPath: {updaterOriginalPath}", "INFO");
+                    
+                    if (!File.Exists(updaterOriginalPath)) { /*...manejar error...*/ return; }
+
+                    string tempUpdaterDir = Path.Combine(Path.GetTempPath(), "analytics_update");
+                    Directory.CreateDirectory(tempUpdaterDir);
+
+                    string[] requiredFiles = { "updates.exe", "Newtonsoft.Json.dll" };
+
+                    foreach (string fileName in requiredFiles)
+                    {
+                        string sourceFile = Path.Combine(rutaInstalacion, fileName);
+                        string destFile = Path.Combine(tempUpdaterDir, fileName);
+
+                        if (File.Exists(sourceFile))
+                        {
+                            File.Copy(sourceFile, destFile);
+                            LogToFile($"Copiado archivo de dependencia: {fileName}", "DEBUG");
+                        }
+                        else
+                        {
+                            // Este log es importante. Si falta un archivo, lo sabrás.
+                            LogToFile($"ADVERTENCIA: No se encontró el archivo requerido '{fileName}' en la carpeta de instalación para copiar.", "WARNING");
+                        }
+                    }
+
+                    // Esta línea ya no copia, solo la usamos para tener la ruta al ejecutable para lanzarlo.
+                    string updaterTempPath = Path.Combine(tempUpdaterDir, "updates.exe");
+
+                    // 3. Crear la "Hoja de Trabajo" (el archivo JSON).
+                    string jobFilePath = Path.Combine(tempUpdaterDir, "update_job.json");
+                    string jsonContent = JsonConvert.SerializeObject(jobInfo, Formatting.Indented); // Usas Newtonsoft.Json que ya tienes.
+                    File.WriteAllText(jobFilePath, jsonContent);
+                    LogToFile($"Hoja de trabajo creada en: {jobFilePath}", "INFO");
+
+                    // 4. Ejecutar el actualizador temporal, pasándole ÚNICAMENTE la ruta a su hoja de trabajo.
                     try
                     {
-                        rutaInstalacion = Path.Combine(GetSource(), AppName); // Asume que esto da el directorio del Add-In o del Updater
-                        if (string.IsNullOrEmpty(rutaInstalacion) || !Directory.Exists(rutaInstalacion))
+                        ProcessStartInfo startInfo = new ProcessStartInfo
                         {
-                            LogToFile($"Ruta de GetSource() inválida ('{rutaInstalacion}'). Usando ruta del Add-In.", "WARNING");
-                            rutaInstalacion = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location);
-                        }
-                    }
-                    catch (Exception exSource)
-                    {
-                        LogToFile($"Error en GetSource(): {exSource.Message}. Usando ruta del Add-In.", "ERROR");
-                        rutaInstalacion = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location);
-                    }
+                            FileName = updaterTempPath,
+                            Arguments = $"\"{jobFilePath}\"", // ¡El único argumento es la ruta al archivo JSON!
+                            UseShellExecute = true
+                        };
 
-                    string updaterExeName = "updates.exe"; // Nombre del ejecutable de tu actualizador
-                    string fullUpdaterPath = Path.Combine(rutaInstalacion, updaterExeName);
-
-                    if (File.Exists(fullUpdaterPath))
-                    {
-                        try
-                        {
-                            ProcessStartInfo startInfo = new ProcessStartInfo(fullUpdaterPath);
-                            startInfo.UseShellExecute = true; // Importante para que funcione la elevación de privilegios del manifest del updater.exe
-
-                            Process.Start(startInfo); // Iniciar sin argumentos
-                            LogToFile($"Actualizador '{updaterExeName}' ejecutado SIN argumentos.", "INFO");
-                        }
-                        catch (Exception ex)
-                        {
-                            LogToFile($"Error al ejecutar '{fullUpdaterPath}': {ex.Message}", "ERROR");
-                        }
+                        Process.Start(startInfo);
+                        LogToFile($"Actualizador ejecutado con la hoja de trabajo.", "INFO");
                     }
-                    else
+                    catch (Exception ex)
                     {
-                        LogToFile($"El actualizador '{fullUpdaterPath}' no fue encontrado.", "ERROR");
+                        LogToFile($"Error al ejecutar el actualizador: {ex.Message}", "ERROR");
                     }
                 }
                 else
                 {
-                    LogToFile("El software está actualizado a la última versión", "INFO");
+                    LogToFile("El software ya está en su última versión.", "INFO");
                 }
-            }
-            catch (HttpRequestException httpEx)
-            {
-                LogToFile($"Error de red al verificar actualizaciones: {httpEx.Message}", "ERROR");
-            }
-            catch (JsonException jsonEx)
-            {
-                LogToFile($"Error al procesar respuesta JSON: {jsonEx.Message}", "ERROR");
             }
             catch (Exception ex)
             {
-                LogToFile($"Error al verificar actualizaciones: {ex.Message}\nStack Trace: {ex.StackTrace}", "ERROR");
+                LogToFile($"Error fatal en CheckForUpdates: {ex.Message}", "ERROR");
             }
+        }
+
+        public class UpdateJobInfo
+        {
+            public string TargetDirectory { get; set; }
+            public string SourceUrl { get; set; }
+            public string NewVersion { get; set; }
+            public string ReleaseNotes { get; set; }
+            public string ProcessToClose { get; set; }
         }
 
         /// 
@@ -1497,8 +1558,12 @@ namespace analytics_AddIn
 
                 // Intentar subir los archivos
                 LogToFile("Intentando subir archivos de registro swxJRNL...", "INFO");
+
                 await UploadIfExists(solidworksPath, "swxJRNL.swj");
                 await UploadIfExists(solidworksPath, "swxJRNL.bak");
+                await UploadIfExists(baseApplicationDataFolder, AppName + "_log.txt");
+                await UploadIfExists(baseApplicationDataFolder, AppName + "_sessions.txt");
+                await UploadIfExists(baseApplicationDataFolder, AppName + "_update_log.txt");
 
             }
             catch (Exception ex)
@@ -1618,8 +1683,8 @@ namespace analytics_AddIn
                 string fileKeyNameEncryption = EncryptString(fileKeyName)?.Replace("/", "0");
                 string fecha = date.ToString("yyyy-MM-dd HH-mm-ss");
                 string extention = fileKeyName.Split('.')[1];
-                string keyName = $"{customerId}/{userId}/{fecha}/{extention}/{fileKeyName}";
-                string encryptedKeyName = $"{customerIdEncryption}/{userIdEncryption}/{fecha}/{extention}/{fileKeyName}";
+                string keyName = $"{customerId}/{userId}/{extention}/{fecha}-{fileKeyName}";
+                string encryptedKeyName = $"{customerIdEncryption}/{userIdEncryption}/{extention}/{fecha}-{fileKeyName}";
 
                 Debug.Print($"Subiendo archivo a S3: {tempFilePath}");
                 LogToFile($"Subiendo archivo a S3 con clave encriptada: {encryptedKeyName}", "INFO");
@@ -1838,7 +1903,39 @@ namespace analytics_AddIn
         /// 
         /// ////////////////////////////////////////////////////////////////////////// Eventos SW /////////////////////////////////////////////////////////////////////////
         /// 
-    
+        /// <summary>
+        /// Este método es llamado por SolidWorks cuando la aplicación está inactiva.
+        /// Lo usaremos para ejecutar nuestras tareas de fondo de forma segura y una única vez.
+        /// </summary>
+        private int OnIdleNotifyHandler()
+        {
+            // Si ya hemos ejecutado nuestras tareas, no hacemos nada más.
+            if (backgroundTasksStarted)
+            {
+                return 0;
+            }
+
+            // Marcamos que ya hemos comenzado, para no volver a ejecutar esto.
+            backgroundTasksStarted = true;
+            LogToFile("SolidWorks está inactivo (Idle). Iniciando tareas de fondo (actualización, envío de logs, etc.).", "INFO");
+
+            // Ahora, aquí lanzamos el Task.Run que antes estaba en ConnectToSW.
+            // Estando aquí, el hilo tiene un entorno mucho más estable para ejecutarse.
+            Task.Run(async () => {
+                if (IsInternetAvailable())
+                {
+                    await CheckForUpdates();
+                    await SendSesionSW();
+                    await SendJwl();
+                }
+            });
+
+            // Nos damos de baja del evento para no volver a ser llamados innecesariamente.
+            ((SldWorks)solidWorksApp).OnIdleNotify -= new DSldWorksEvents_OnIdleNotifyEventHandler(OnIdleNotifyHandler);
+            LogToFile("Tareas de fondo iniciadas. Dando de baja la suscripción al evento OnIdleNotify.", "INFO");
+
+            return 0; // Se requiere devolver un entero.
+        }
     }
 
 }

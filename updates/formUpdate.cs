@@ -1,19 +1,19 @@
-﻿using System;
-using System.Diagnostics;
-using System.IO;
-using System.Net.Http;
-using System.Threading.Tasks;
-using System.Windows.Forms;
-using System.IO.Compression;
-using Microsoft.Win32;
-using System.Security.Principal;
-using System.Text;
-using System.Xml.Linq;
+﻿using Microsoft.Win32;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using System;
 using System.Collections.Generic;
-using System.Net;
+using System.Diagnostics;
+using System.IO;
+using System.IO.Compression;
 using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Security.Principal;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using System.Xml.Linq;
 
 namespace updates
 {
@@ -29,13 +29,28 @@ namespace updates
         public string link;
         public string AppName = "analytics";
         private string LogFilePath = "";
+        private string baseApplicationDataFolder = "";
+        private bool testUpdate = false;
+        private readonly string executionMode = "prod";
 
-
-        public formUpdate()
+        public class UpdateJobInfo
         {
+            public string TargetDirectory { get; set; }
+            public string SourceUrl { get; set; }
+            public string NewVersion { get; set; }
+            public string ReleaseNotes { get; set; }
+            public string ProcessToClose { get; set; }
+        }
+
+        // EL CONSTRUCTOR ANTIGUO AHORA LLAMA AL NUEVO CON null
+        // Esto asegura que el Diseñador de Formularios siga funcionando
+        public formUpdate(){
+            // ¡MUY IMPORTANTE! InitializeComponent() DEBE ser la primera línea.
+            InitializePaths();
             InitializeComponent();
+
+            // El resto de la inicialización va después.
             this.Load += update_Load;
-            // Verificar si ya hay otra instancia en ejecución durante la inicialización
             VerificarInstanciasMultiples();
         }
 
@@ -89,84 +104,132 @@ namespace updates
             }
         }
 
+        private void InitializePaths()
+        {
+            string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            baseApplicationDataFolder = Path.Combine(localAppData, AppName);
+            Directory.CreateDirectory(baseApplicationDataFolder);
+
+            LogFilePath = Path.Combine(baseApplicationDataFolder, AppName + "_update_log.txt");
+        }
         private void LogToFile(string message, string level = "INFO")
         {
+            // Si LogFilePath no se pudo inicializar en el constructor (error crítico), no podemos loguear a archivo.
+            if (string.IsNullOrEmpty(LogFilePath))
+            {
+                Debug.Print($"FALLBACK LOG (LogFilePath no disponible): [{level}] - {message}");
+                return;
+            }
+
             try
             {
-                LogFilePath = Path.Combine(ObtenerRutaInstalacion(), "update_log.txt");
                 string timeStamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
-                string logEntry = "";
+                string logEntry;
                 if (level.ToUpper() == "ERROR")
                 {
-                    logEntry = $@"
-                        [---------------------------- ERROR ----------------------------]
-                        Fecha: {timeStamp}
-                        Mensaje: {message}
-                        [--------------------------------------------------------------]";
+                    logEntry = $"\r\n[---------------------------- ERROR ----------------------------]\r\n" +
+                               $"Fecha: {timeStamp}\r\n" +
+                               $"Mensaje: {message}\r\n" +
+                               $"[--------------------------------------------------------------]\r\n";
                 }
                 else
                 {
-                    logEntry = $"{timeStamp} [{level}] - {message}";
+                    logEntry = $"{timeStamp} [{level}] - {message}\r\n";
                 }
-                using (StreamWriter writer = new StreamWriter(LogFilePath, true))
-                {
-                    writer.WriteLine(logEntry);
-                }
+                File.AppendAllText(LogFilePath, logEntry); // File.AppendAllText maneja el using y close.
             }
-            catch
+            catch (Exception ex)
             {
-                Debug.Print("Error al escribir en el log.");
+                // Si falla el logging, escribir a Debug para no entrar en bucle infinito.
+                Debug.Print($"ERROR AL ESCRIBIR EN LOG '{LogFilePath}': {ex.Message}. Mensaje original: {message}");
             }
         }
 
         // Método para cargar el formulario - reemplaza el actual update_Load
         private async void update_Load(object sender, EventArgs e)
         {
-            try
+            // Obtenemos los argumentos con los que se ejecutó esta aplicación.
+            string[] args = Environment.GetCommandLineArgs();
+            string jobFilePath = (args.Length > 1 && File.Exists(args[1])) ? args[1] : null;
+
+            // =====================================================================================
+            // CASO 1: MODO INSTRUCCIONES (Lanzado desde el Add-In con una "hoja de trabajo")
+            // =====================================================================================
+            if (jobFilePath != null)
             {
-                LogToFile("Inicializando formulario de actualización");
-
-                // Configurar la UI inicial con mensaje de cargando
-                lblVersionActual.Text = "Verificando versión actual...";
-                lbversion.Text = "Buscando actualizaciones...";
-                rtbcambios.Text = "Cargando información...";
-                progressBar1.Visible = true;
-                btnactualizar.Enabled = false;
-
-                if (IsInternetAvailable())
+                LogToFile($"Actualizador iniciado en MODO INSTRUCCIONES desde la hoja de trabajo: {jobFilePath}");
+                try
                 {
-                    LogToFile("Conexión a internet detectada. Verificando actualizaciones...", "INFO");
+                    // Leemos y procesamos el archivo JSON
+                    string jsonContent = File.ReadAllText(jobFilePath);
+                    var jobInfo = JsonConvert.DeserializeObject<UpdateJobInfo>(jsonContent);
 
-                    try
-                    {
-                        // Determinar la versión actual del software instalado
-                        ObtenerVersionActual();
+                    LogToFile($"Actualizador iniciado en MODO INSTRUCCIONES desde la hoja de trabajo: {jobInfo}");
+                    // Rellenamos la información del formulario con los datos de la hoja de trabajo
+                    this.versionNueva = jobInfo.NewVersion;
+                    this.cambios = jobInfo.ReleaseNotes;
+                    this.link = jobInfo.SourceUrl;
+                    btnactualizar.Tag = jobInfo.TargetDirectory; // Guardamos la ruta de destino para usarla al hacer clic
 
-                        // Buscar actualizaciones de forma asincrónica (usar await en lugar de Task.Run)
-                        await BuscarActualizaciones();
+                    // Obtenemos la versión actual de la carpeta de destino que nos indicaron
+                    ObtenerVersionActual(jobInfo.TargetDirectory);
 
-                        // Actualizar la UI con los datos obtenidos
-                        ActualizarInterfazConDatos();
+                    // Actualizamos la interfaz con la información lista
+                    ActualizarInterfazConDatos();
 
-                        LogToFile($"Verificación completada. Versión actual: {versionActual}, Nueva versión: {versionNueva}");
-                    }
-                    catch (Exception asyncEx)
-                    {
-                        LogToFile($"Error en tareas asincrónicas de conexión: {asyncEx.Message}\nStack Trace: {asyncEx.StackTrace}", "ERROR");
-                        // Actualizar la UI para mostrar el error
-                        ActualizarInterfazConError("Error al verificar actualizaciones. Intente nuevamente más tarde.");
-                    }
+                    // Borramos la hoja de trabajo, ya no es necesaria
+                    //File.Delete(jobFilePath);
                 }
-                else
+                catch (Exception ex)
                 {
-                    LogToFile("No hay conexión a internet. No se verificarán actualizaciones.", "WARNING");
-                    ActualizarInterfazConError("No hay conexión a internet. Por favor, verifique su conexión e intente nuevamente.");
+                    LogToFile($"Error al procesar la hoja de trabajo: {ex.Message}", "ERROR");
+                    ActualizarInterfazConError("Error al leer las instrucciones de actualización.");
                 }
             }
-            catch (Exception ex)
+            // =====================================================================================
+            // CASO 2: MODO MANUAL (Lanzado por el usuario, sin instrucciones)
+            // - Aquí replicamos tu lógica original y funcional -
+            // =====================================================================================
+            else
             {
-                LogToFile($"Error general en la carga del formulario: {ex.Message}", "ERROR");
-                ActualizarInterfazConError("Error al inicializar. Por favor, reinicie la aplicación.");
+                LogToFile("Actualizador iniciado en MODO MANUAL. Verificando todo desde cero.");
+                try
+                {
+                    // 1. Mostramos en la UI que estamos trabajando
+                    lblVersionActual.Text = "Verificando versión actual...";
+                    lbversion.Text = "Buscando actualizaciones...";
+                    rtbcambios.Text = "Cargando información...";
+                    progressBar1.Visible = true;
+                    btnactualizar.Enabled = false;
+
+                    // 2. Verificamos la conexión a internet
+                    if (IsInternetAvailable())
+                    {
+                        LogToFile("Conexión a internet detectada.");
+
+                        // 3. Obtenemos la ruta de instalación por el método antiguo
+                        string rutaInstalacion = ObtenerRutaInstalacion();
+
+                        // 4. Leemos la versión LOCAL de esa ruta
+                        ObtenerVersionActual(rutaInstalacion);
+
+                        // 5. Buscamos la versión NUEVA en la API
+                        await BuscarActualizaciones();
+
+                        // 6. Con toda la información recopilada, actualizamos la interfaz
+                        ActualizarInterfazConDatos();
+                    }
+                    else
+                    {
+                        LogToFile("No hay conexión a internet.", "WARNING");
+                        ActualizarInterfazConError("No hay conexión a internet. Por favor, verifique su conexión e intente nuevamente.");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogToFile($"Error general en la carga del formulario en modo manual: {ex.Message}", "ERROR");
+                    ActualizarInterfazConError("Error al inicializar. Por favor, reinicie la aplicación.");
+                }
             }
         }
 
@@ -187,7 +250,16 @@ namespace updates
                 LogToFile("Token obtenido. Consultando información de la última versión...", "INFO");
                 var request = new HttpRequestMessage(HttpMethod.Post, API_Xpertme_URL);
                 request.Headers.Add("Authorization", $"Bearer {token}");
-                request.Content = new StringContent("{ \"mode\": \"dev\" }", Encoding.UTF8, "application/json");
+                // ---------------------------  EXECUTION MODE -----------------------------------------
+                // Creamos un objeto anónimo con nuestro modo dinámico.
+                var payload = new { mode = this.executionMode };
+
+                // Convertimos ese objeto a una cadena JSON de forma segura.
+                string jsonPayload = JsonConvert.SerializeObject(payload);
+
+                // Usamos la cadena JSON en el contenido de la petición.
+                request.Content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
+                // -------------------------------------------------------------------------------------
 
                 LogToFile("Enviando solicitud de verificación de actualizaciones...", "INFO");
                 var response = await client.SendAsync(request);
@@ -208,9 +280,18 @@ namespace updates
                     throw new Exception("Información de actualización no disponible");
                 }
 
-                versionNueva = lastInstaller["Version"]?.ToString();
-                cambios = lastInstaller["ReleaseNotes"]?.ToString();
-                link = lastInstaller["publicDllLink"]?.ToString();
+                if (testUpdate)
+                {
+                    versionNueva = "1.0.4";
+                    cambios = "Test 1";
+                    link = "http://localhost/analytics/analytics-v1.0.4.zip";
+                }
+                else
+                {
+                    versionNueva = lastInstaller["Version"]?.ToString();
+                    cambios = lastInstaller["ReleaseNotes"]?.ToString();
+                    link = lastInstaller["publicDllLink"]?.ToString();
+                }
 
                 if (string.IsNullOrEmpty(versionNueva))
                 {
@@ -238,50 +319,34 @@ namespace updates
         }
 
         // Método para obtener la versión actual del software
-        private void ObtenerVersionActual()
+        /// <summary>
+        /// Obtiene la versión del Add-In desde la carpeta de instalación especificada.
+        /// </summary>
+        /// <param name="carpetaDeDestino">La ruta completa a la carpeta de instalación del Add-In.</param>
+        private void ObtenerVersionActual(string carpetaDeDestino)
         {
             try
             {
-                // Obtener la versión del ejecutable actual
-                string rutaInstalacion = ObtenerRutaInstalacion();
-                string rutaEjecutable = Path.Combine(rutaInstalacion, "DLL\\" + AppName + "_AddIn.dll");
+                // Ya no adivina la ruta. Usa directamente la que se le pasa como parámetro.
+                string rutaEjecutable = Path.Combine(carpetaDeDestino, "DLL\\" + AppName + "_AddIn.dll");
 
                 LogToFile($"Intentando obtener versión de: {rutaEjecutable}");
                 if (File.Exists(rutaEjecutable))
                 {
-                    LogToFile($"Archivo ENCONTRADO: {rutaEjecutable}");
                     FileVersionInfo versionInfo = FileVersionInfo.GetVersionInfo(rutaEjecutable);
                     versionActual = versionInfo.FileVersion ?? "Desconocida";
                     LogToFile($"Versión leída de DLL: {versionActual}");
                 }
                 else
                 {
-                    LogToFile($"Archivo NO ENCONTRADO: {rutaEjecutable}");
-                    // Si no se encuentra el ejecutable, buscar en el mismo directorio que el actualizador
-                    string rutaActualizador = Application.ExecutablePath;
-                    string directorioActualizador = Path.GetDirectoryName(rutaActualizador);
-                    string ejecutableApp = Path.Combine(directorioActualizador, AppName + ".exe");
-
-                    LogToFile($"Intentando obtener versión de: {ejecutableApp}");
-                    if (File.Exists(ejecutableApp))
-                    {
-                        LogToFile($"Archivo ENCONTRADO: {ejecutableApp}");
-                        FileVersionInfo versionInfo = FileVersionInfo.GetVersionInfo(ejecutableApp);
-                        versionActual = versionInfo.FileVersion ?? "Desconocida";
-                        LogToFile($"Versión leída de EXE: {versionActual}");
-                    }
-                    else
-                    {
-                        versionActual = "No se pudo determinar";
-                    }
+                    LogToFile($"Archivo NO ENCONTRADO en la ruta de destino: {rutaEjecutable}", "WARNING");
+                    versionActual = "No instalado";
                 }
-
-                LogToFile($"Versión actual determinada: {versionActual}");
             }
             catch (Exception ex)
             {
-                LogToFile($"Error al obtener versión actual: {ex.Message}", "ERROR");
-                versionActual = "Error al determinar versión";
+                LogToFile($"Error al obtener versión actual desde '{carpetaDeDestino}': {ex.Message}", "ERROR");
+                versionActual = "Error";
             }
         }
 
@@ -374,6 +439,7 @@ namespace updates
             try
             {
                 LogToFile("Iniciando proceso de actualización");
+                string tempFolderPath = Path.Combine(Path.GetTempPath(), AppName + "_update");
 
                 // Verificar si la aplicación tiene permisos de administrador
                 if (!EsAdministrador())
@@ -426,8 +492,19 @@ namespace updates
                 progressBar1.Value = 0;
 
                 // Obtener ruta de instalación correcta
-                string programPath = ObtenerRutaInstalacion();
-                LogToFile($"Ruta de instalación: {programPath}");
+                string programPath;
+
+                // Si el Tag del botón tiene algo, es la ruta de destino que nos pasó la hoja de trabajo.
+                if (btnactualizar.Tag != null)
+                {
+                    programPath = btnactualizar.Tag.ToString();
+                    LogToFile($"Ruta de instalación obtenida desde la hoja de trabajo: {programPath}");
+                }
+                else // Si no, es un lanzamiento manual, la obtenemos como antes.
+                {
+                    programPath = ObtenerRutaInstalacion();
+                    LogToFile($"Ruta de instalación obtenida en modo manual: {programPath}");
+                }
 
                 if (string.IsNullOrEmpty(programPath))
                 {
@@ -440,7 +517,7 @@ namespace updates
                 progressBar1.Value = 10;
                 await Task.Delay(500);
 
-                temp = Path.Combine(Path.GetTempPath(), AppName + "_update");
+                temp = tempFolderPath;
                 LogToFile($"Carpeta temporal: {temp}");
 
                 if (Directory.Exists(temp))
@@ -541,17 +618,18 @@ namespace updates
                 await Task.Delay(500);
                 LogToFile("Actualización completada con éxito");
 
-                // Mensaje de confirmación después de actualizar
-                MessageBox.Show(
-                    "La actualización se ha completado con éxito.\nSe reiniciará la aplicación para aplicar los cambios.",
-                    "Actualización completada",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Information
+                // Mensaje de confirmación final
+                MessageBox.Show(
+                  "La actualización se ha completado con éxito.\nSolidWorks se iniciará a continuación.",
+                  "Actualización completada",
+                  MessageBoxButtons.OK,
+                  MessageBoxIcon.Information
                 );
+                LimpiarCarpetaDeFormaExterna(temp);
 
-                LogToFile("Cerrando aplicación para aplicar cambios");
+                // Ahora sí, cerrar esta aplicación de actualización
+                LogToFile("Cerrando el actualizador.");
                 Application.Exit();
-                CerrarSolidWorks();
             }
             catch (Exception ex)
             {
@@ -575,6 +653,38 @@ namespace updates
                     LogToFile($"Error al restaurar: {exRestore.Message}", "ERROR");
                     Debug.WriteLine("Error al restaurar: " + exRestore.Message);
                 }
+                string tempFolderPath = Path.Combine(Path.GetTempPath(), AppName + "_update");
+                LimpiarCarpetaDeFormaExterna(tempFolderPath);
+            }
+        }
+
+        /// <summary>
+        /// Lanza un proceso cmd.exe independiente y oculto para que elimine una carpeta después de un breve retraso.
+        /// </summary>
+        /// <param name="folderPath">La ruta de la carpeta a eliminar.</param>
+        private void LimpiarCarpetaDeFormaExterna(string folderPath)
+        {
+            try
+            {
+                LogToFile($"Preparando limpieza externa para la carpeta: {folderPath}");
+
+                // El comando a ejecutar: "espera 2 segundos Y LUEGO borra la carpeta /S (recursivo) /Q (silencioso)"
+                string command = $"/C timeout /t 2 /nobreak & rd /s /q \"{folderPath}\"";
+
+                ProcessStartInfo startInfo = new ProcessStartInfo("cmd.exe")
+                {
+                    Arguments = command,
+                    UseShellExecute = true,
+                    CreateNoWindow = true, // No mostrar la ventana de la consola
+                    WindowStyle = ProcessWindowStyle.Hidden // Asegurarse de que esté oculta
+                };
+
+                Process.Start(startInfo);
+                LogToFile("Proceso de limpieza externa lanzado con éxito.");
+            }
+            catch (Exception ex)
+            {
+                LogToFile($"No se pudo lanzar el proceso de limpieza externa: {ex.Message}", "ERROR");
             }
         }
 

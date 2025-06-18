@@ -33,7 +33,7 @@ namespace instalador
         string VERSION = "", AssemblyVERSION = "", ARCHIVO = "", URL = "", LINK = "";
         // datos que se guardan
         string email = "", password = "", UserID = "", deviceID = "", deviceAlias = "", deviceName = "", code = "", osVersion = "", deviceMAC = "", swActivies = "", campus = "";
-        string mode = "dev";
+        string mode = "prod";
         string DllAddIn = "analytics_AddIn";
         private Dictionary<string, int> customerMapping = new Dictionary<string, int>();
         private int selectedCustomerID = 0; // Aquí guardarás el CustomerID del seleccionado
