@@ -831,7 +831,8 @@ namespace instalador
                 Directory.CreateDirectory(temp);
                 temp = Path.Combine(temp, ARCHIVO);
                 wc.DownloadFileAsync(new Uri(URL), temp);
-                rtbprogreso.Text = "Descargando " + URL;
+                // rtbprogreso.Text = "Descargando " + URL;
+                rtbprogreso.Text = "Descargando archivos";
                 lbprogreso.Text = "Instalando...";
             }
         }

@@ -55,6 +55,9 @@ namespace analytics_AddIn
         private const string TOKEN_Analitics_URL = "https://api-ncsw.xpertme.com/api/auth";
         private readonly string executionMode = "prod";
 
+        // Nuestro diccionario "traductor". Mapea texto técnico del Journal a acciones legibles.
+        private Dictionary<string, string> actionDictionary;
+
         private bool testUpdate = false;
 
         // --- Cliente HTTP Estático ---
@@ -64,11 +67,13 @@ namespace analytics_AddIn
 
         #region Rutas y Configuración del Add-In
 
-        // Usamos 'readonly' para asegurar que estas rutas se establezcan solo una vez en el constructor.
         private string baseApplicationDataFolder;
         private string LogFilePath;
         private string ConfigFilePath;
         private string tempFolder;
+        private string historyActionLogPath;
+        private string summaryActionLogPath;
+        private long lastJournalFileSize = 0;
 
         #endregion
 
@@ -88,6 +93,8 @@ namespace analytics_AddIn
         private System.Timers.Timer heartbeatTimer;
         private FileSystemWatcher journalFileWatcher;
         private static readonly object _sessionFileLock = new object();
+        private string lastLoggedAction = "";
+        private DateTime lastLoggedTime = DateTime.MinValue;
 
         #endregion
 
@@ -107,6 +114,8 @@ namespace analytics_AddIn
                 InitializePaths();
                 // Luego, preparamos el sistema de seguimiento de actividad.
                 InitializeActivityTracking();
+                // Inicializamos nuestro diccionario de acciones para que esté listo.
+                InitializeActionDictionary();
                 // Finalmente, cargamos otras configuraciones si es necesario.
                 LoadConfiguration();
             }
@@ -186,22 +195,6 @@ namespace analytics_AddIn
 
                 LogToFile("Suscripción al evento OnIdleNotify completada.", "INFO");
 
-                // Inicia el monitoreo del archivo Journal.
-                InitializeJournalMonitoring();
-
-                // Revisa si la sesión anterior tuvo un crash.
-                HandlePreviousSessionCrash();
-
-                // Ejecuta tareas de fondo.
-                //Task.Run(async () => {
-                //    if (IsInternetAvailable())
-                //    {
-                //        await CheckForUpdates();
-                //        await SendSesionSW();
-                //        await SendJwl();
-                //    }
-                //});
-
                 LogToFile("Conexión con SOLIDWORKS completada.", "INFO");
                 return true;
             }
@@ -219,7 +212,7 @@ namespace analytics_AddIn
                 LogToFile("LoadConfiguration cargado correctamente", "INFO");
 
                 // Limpiar configuración anterior
-               
+
 
                 // Log final de configuración (sin mostrar valores sensibles)
                 LogToFile("-----------------Estado de configuración------------------", "INFO");
@@ -333,15 +326,79 @@ namespace analytics_AddIn
         }
 
         /// <summary>
-        /// Este método se dispara CADA VEZ que el archivo swxJRNL.swj es modificado.
+        /// Se dispara CADA VEZ que el archivo swxJRNL.swj es modificado.
+        /// Lee solo las nuevas líneas y las manda a procesar.
         /// </summary>
         private void OnJournalFileChanged(object sender, FileSystemEventArgs e)
         {
-            LogToFile($"Detectado cambio en archivo Journal: {e.ChangeType}", "DEBUG");
+            try
+            {
+                RecordUserActivity();
 
-            // ¡Cada cambio en el archivo es una actividad del usuario!
-            // Llamamos a nuestro método central para manejar la actividad.
-            RecordUserActivity();
+                // Ahora, leemos solo las líneas nuevas que se añadieron al archivo Journal.
+                List<string> newLines = ReadNewJournalLines(e.FullPath);
+
+                if (newLines.Any())
+                {
+                    // Por ahora, solo mostraremos en el log que hemos capturado las nuevas líneas.
+                    // En el siguiente paso, aquí llamaremos a la función de "parseo".
+                    if (newLines.Any())
+                    {
+                        ProcessNewJournalLines(newLines);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogToFile($"Error en OnJournalFileChanged: {ex.ToString()}", "ERROR");
+            }
+        }
+
+        /// <summary>
+        /// Lee un archivo de texto desde la última posición conocida y actualiza la posición.
+        /// </summary>
+        /// <param name="filePath">Ruta al archivo a leer.</param>
+        /// <returns>Una lista de las nuevas líneas de texto.</returns>
+        private List<string> ReadNewJournalLines(string filePath)
+        {
+            var newLines = new List<string>();
+            try
+            {
+                // Abrimos el archivo permitiendo que otros procesos (como SolidWorks) puedan escribir en él.
+                using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    long currentSize = fs.Length;
+
+                    // Si el archivo es más pequeño que la última vez, significa que SolidWorks lo reseteó.
+                    if (currentSize < lastJournalFileSize)
+                    {
+                        lastJournalFileSize = 0;
+                    }
+
+                    // Si hay contenido nuevo, lo leemos.
+                    if (currentSize > lastJournalFileSize)
+                    {
+                        fs.Seek(lastJournalFileSize, SeekOrigin.Begin); // Movemos el cursor a donde nos quedamos
+
+                        using (var sr = new StreamReader(fs))
+                        {
+                            string line;
+                            while ((line = sr.ReadLine()) != null)
+                            {
+                                newLines.Add(line);
+                            }
+                        }
+                    }
+
+                    // Actualizamos la última posición leída para la próxima vez.
+                    lastJournalFileSize = currentSize;
+                }
+            }
+            catch (Exception ex)
+            {
+                LogToFile($"No se pudo leer el archivo Journal: {ex.Message}", "WARNING");
+            }
+            return newLines;
         }
 
         /// <summary>
@@ -361,6 +418,175 @@ namespace analytics_AddIn
                     RegisterSolidWorksSession("Close");
                 }
             }
+        }
+
+
+        /// <summary>
+        /// Revisa el archivo HistoryAction.log al inicio y se asegura de que cualquier bloque anterior esté cerrado.
+        /// </summary>
+        private void EnsurePreviousHistoryLogIsClosed()
+        {
+            try
+            {
+                // Si el archivo no existe o está vacío, no hay nada que hacer.
+                if (!File.Exists(historyActionLogPath) || new FileInfo(historyActionLogPath).Length == 0)
+                {
+                    return;
+                }
+
+                var lastLine = File.ReadLines(historyActionLogPath).LastOrDefault(line => !string.IsNullOrWhiteSpace(line));
+
+                // Si la última línea no es "EndFile", la añadimos para cerrar el bloque anterior.
+                if (lastLine != null && !lastLine.Equals("EndFile", StringComparison.OrdinalIgnoreCase))
+                {
+                    LogToFile("Detectado HistoryAction.log sin cerrar. Añadiendo 'EndFile' para cerrar el bloque anterior.", "WARNING");
+                    File.AppendAllText(historyActionLogPath, "EndFile\r\n");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogToFile($"Error al asegurar que el log de historial estuviera cerrado: {ex.Message}", "ERROR");
+            }
+        }
+
+        /// <summary>
+        /// Inicializa y puebla nuestro diccionario de acciones.
+        /// Aquí es donde "enseñamos" al Add-In qué buscar en el archivo Journal.
+        /// </summary>
+        private void InitializeActionDictionary()
+        {
+            actionDictionary = new Dictionary<string, string>
+        {
+            // --- Operaciones 3D Específicas (Más prioritarias) ---
+            { "swFmSweepCut", "Corte de Barrido" },
+            { "swFmSweep", "Saliente de Barrido" },
+            { "swFmExtrude", "Extrusión" }, // Cubre tanto saliente como corte si no se especifica más
+            { "swFmLoft", "Saliente de Recubrir" },
+            { "swFmLoftCut", "Corte de Recubrir" },
+            { "swFmRevolve", "Revolución" },
+            { "swFmRevCut", "Corte de Revolución" },
+            { "swFmFillet", "Redondeo de Operación" },
+            { "swFmChamfer", "Chaflán de Operación" },
+            { "swApp.ActivateDoc2", "Documento activo"  },
+
+            // --- Acciones de Croquis ---
+            { ".SketchManager.CreateCircle", "Crear Círculo" },
+            { ".SketchManager.CreateLine", "Crear Línea" },
+            { ".SketchManager.CreateFillet", "Crear Redondeo de Croquis" },
+            { ".SketchManager.CreatePoint", "Crear Punto" },
+            { ".SketchManager.InsertSketch", "Insertar/Salir de Croquis" },
+            { ".Insert3DSketch2", "Iniciar Croquis 3D" },
+            { ".SketchAddConstraints", "Añadir Restricción de Croquis" },
+            { ".AddDimension2", "Añadir Cota" },
+
+            // --- Acciones de Vista ---
+            { ".ViewZoomtofit2", "Zoom para Ajustar" },
+            { ".RotateAboutCenter", "Rotar Vista" },
+            { ".RollBy", "Rodar Vista" },
+            { ".GraphicsRedraw2", "Redibujar Gráficos" },
+
+            // --- Acciones de Documento ---
+            { ".NewDocument", "Nuevo Documento" },
+            { ".CloseDoc", "Cerrar Documento" },
+            { ".Save3", "Guardar Documento" },
+            
+            // --- Acciones Generales (Menos prioritarias) ---
+            { ".FeatureManager.CreateFeature", "Crear Operación Genérica" },
+            { ".Extension.SelectByID2", "Seleccionar Entidad" },
+            { ".ClearSelection2", "Limpiar Selección" }
+        };
+            LogToFile("Diccionario de acciones expandido e inicializado.", "INFO");
+        }
+
+        /// <summary>
+        /// Se llama cada vez que el FileSystemWatcher detecta nuevas líneas en el archivo Journal.
+        /// </summary>
+        private void ProcessNewJournalLines(List<string> newLines)
+        {
+            try
+            {
+                var actionsToLog = new List<string>();
+
+                foreach (var line in newLines)
+                {
+                    if (string.IsNullOrWhiteSpace(line) || line.Trim().StartsWith("'") || line.Trim().StartsWith("Dim ")) continue;
+
+                    // Gracias al orden del diccionario, la primera coincidencia que encontremos será la más específica.
+                    foreach (var entry in actionDictionary)
+                    {
+                        if (line.Contains(entry.Key))
+                        {
+                            string action = entry.Value;
+
+                            // Lógica anti-spam solo para los eventos de vista que se repiten mucho
+                            if ((action == "Rotar Vista" || action == "Rodar Vista") &&
+                                action == lastLoggedAction && (DateTime.Now - lastLoggedTime).TotalSeconds < 2)
+                            {
+                                continue; // Ignora este evento repetido, pero sigue buscando otras acciones en la misma línea
+                            }
+
+                            string value = ExtractValueFromLine(line, action);
+
+                            if (value.Contains("C:\\ProgramData\\SolidWorks\\SOLIDWORKS 2025"))
+                            {
+                                value = value.Split('\\')[4];
+                            }
+                            string timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+                            actionsToLog.Add($"{action}, {value}, {timestamp}");
+
+                            lastLoggedAction = action;
+                            lastLoggedTime = DateTime.Now;
+
+                            break; // Encontramos la acción más específica para esta línea, pasamos a la siguiente.
+                        }
+                    }
+                }
+
+                if (actionsToLog.Any())
+                {
+                    lock (_sessionFileLock)
+                    {
+                        File.AppendAllLines(historyActionLogPath, actionsToLog);
+                    }
+                    LogToFile($"Registradas {actionsToLog.Count} nuevas acciones en HistoryAction.log.", "DEBUG");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogToFile($"Error procesando líneas del Journal: {ex.ToString()}", "ERROR");
+            }
+        }
+
+        /// <summary>
+        /// Función simple para extraer el "valor" principal de una línea de comando del Journal.
+        /// Por ejemplo, el nombre de un archivo o las coordenadas de un círculo.
+        /// </summary>
+        private string ExtractValueFromLine(string line, string action)
+        {
+            try
+            {
+                // Para acciones que involucran nombres (archivos, entidades), buscamos texto entre comillas.
+                if (action.Contains("Documento") || action.Contains("Seleccionar") || action.Contains("Restricción"))
+                {
+                    int firstQuote = line.IndexOf('"');
+                    if (firstQuote != -1)
+                    {
+                        int secondQuote = line.IndexOf('"', firstQuote + 1);
+                        if (secondQuote != -1) return line.Substring(firstQuote + 1, secondQuote - firstQuote - 1);
+                    }
+                }
+
+                // Para acciones que involucran parámetros (geometría, vistas), extraemos lo que está entre paréntesis.
+                int firstParen = line.IndexOf('(');
+                if (firstParen != -1)
+                {
+                    int secondParen = line.LastIndexOf(')');
+                    if (secondParen > firstParen) return line.Substring(firstParen + 1, secondParen - firstParen - 1).Trim();
+                }
+            }
+            catch { /* Ignorar errores de parseo simples */ }
+
+            return "N/A";
         }
 
         #endregion
@@ -402,6 +628,10 @@ namespace analytics_AddIn
 
                 // Registramos el inicio de la sesión de actividad.
                 RegisterSolidWorksSession("Open");
+
+                EnsurePreviousHistoryLogIsClosed();
+                // Al iniciar una nueva sesión de actividad, escribimos "StartFile" en el log de historial.
+                File.AppendAllText(historyActionLogPath, "StartFile\r\n");
 
                 // Iniciamos el temporizador de pulsos.
                 heartbeatTimer.Start();
@@ -489,122 +719,81 @@ namespace analytics_AddIn
             }
         }
 
+        /// <summary>
+        /// Lee el archivo de historial de acciones, cuenta las ocurrencias de cada acción y
+        /// escribe el resultado en un archivo de resumen.
+        /// </summary>
+        private void GenerateActionSummary()
+        {
+            try
+            {
+                LogToFile("Generando resumen de acciones...", "INFO");
+                if (!File.Exists(historyActionLogPath))
+                {
+                    LogToFile("No se encontró HistoryAction.log para generar el resumen.", "WARNING");
+                    return;
+                }
+
+                // Usamos un diccionario para contar cada acción.
+                var actionCounts = new Dictionary<string, int>();
+
+                // Leemos todas las líneas del log de historial.
+                var historyLines = File.ReadLines(historyActionLogPath);
+
+                foreach (var line in historyLines)
+                {
+                    // Ignoramos los marcadores de inicio y fin de sesión.
+                    if (string.IsNullOrWhiteSpace(line) ||
+                        line.Equals("StartFile", StringComparison.OrdinalIgnoreCase) ||
+                        line.Equals("EndFile", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    // Extraemos el nombre de la acción (es la primera parte antes de la coma).
+                    string action = line.Split(',')[0].Trim();
+
+                    // Contamos la acción.
+                    if (actionCounts.ContainsKey(action))
+                    {
+                        actionCounts[action]++;
+                    }
+                    else
+                    {
+                        actionCounts[action] = 1;
+                    }
+                }
+
+                // Si no hay acciones que contar, no creamos el archivo.
+                if (!actionCounts.Any())
+                {
+                    LogToFile("No se encontraron acciones para resumir.", "INFO");
+                    return;
+                }
+
+                // Preparamos las líneas para el archivo de resumen.
+                var summaryLines = new List<string>();
+                foreach (var entry in actionCounts)
+                {
+                    summaryLines.Add($"{entry.Key}, {entry.Value}"); // Formato: Acción, Conteo
+                }
+
+                // Escribimos el archivo de resumen, sobrescribiendo el anterior.
+                MessageBox.Show(summaryActionLogPath);
+                File.WriteAllLines(summaryActionLogPath, summaryLines);
+                LogToFile($"Resumen de acciones guardado exitosamente en: {summaryActionLogPath}", "INFO");
+            }
+            catch (Exception ex)
+            {
+                LogToFile($"Error al generar el resumen de acciones: {ex.ToString()}", "ERROR");
+            }
+        }
         #endregion
         /// 
         /// ////////////////////////////////////////////////////////////////////////// Trabajar con el archivo txt de sesiones /////////////////////////////////////////////////////////////////////////
         /// 
         /// 
         #region
-        /// 
-        /// Verifica si el archivo de configuración existe.
-        /// 
-        private bool DoesConfigFileExist()
-        {
-            try
-            {
-                return File.Exists(ConfigFilePath);
-            }
-            catch (Exception ex)
-            {
-                LogToFile($"Error al verificar la existencia del archivo de configuración: {ex.Message}", "ERROR");
-                return false;
-            }
-        }
-
-        /// 
-        /// Crea un nuevo archivo de configuración si no existe.
-        /// 
-        private void CreateConfigFile()
-        {
-            try
-            {
-                LogToFile($"Intentando crear archivo de configuración en: {ConfigFilePath}", "INFO");
-                string directoryPath = Path.GetDirectoryName(ConfigFilePath);
-
-                if (!Directory.Exists(directoryPath))
-                {
-                    LogToFile($"El directorio no existe. Creando directorio: {directoryPath}", "INFO");
-                    Directory.CreateDirectory(directoryPath);
-                }
-
-                using (FileStream fs = File.Create(ConfigFilePath))
-                {
-                    LogToFile("Archivo de configuración creado exitosamente", "INFO");
-                }
-
-                LogToFile("Configurando permisos del archivo...", "INFO");
-                SetFilePermissions(ConfigFilePath);
-
-                // LogToFile("Registrando sesión inicial de SOLIDWORKS", "INFO");
-                // RegisterSolidWorksSession("Open");
-            }
-            catch (UnauthorizedAccessException uaEx)
-            {
-                LogToFile($"Error de permisos al crear archivo de configuración: {uaEx.Message}", "ERROR");
-                // Intentar crear en una ubicación alternativa como último recurso
-                try
-                {
-                    string altPath = Path.Combine(System.Environment.GetFolderPath(System.Environment.SpecialFolder.LocalApplicationData),
-                                                 AppName, $"{AppName}_sessions.txt");
-                    LogToFile($"Intentando crear archivo en ubicación alternativa: {altPath}", "WARNING");
-
-                    Directory.CreateDirectory(Path.GetDirectoryName(altPath));
-                    using (FileStream fs = File.Create(altPath))
-                    {
-                        ConfigFilePath = altPath;  // Actualizar la ruta del archivo
-                        LogToFile($"Archivo creado en ubicación alternativa: {altPath}", "INFO");
-                    }
-                    SetFilePermissions(ConfigFilePath);
-                    //RegisterSolidWorksSession("Open");
-                }
-                catch (Exception altEx)
-                {
-                    LogToFile($"Error al crear archivo en ubicación alternativa: {altEx.Message}", "ERROR");
-                }
-            }
-            catch (IOException ioEx)
-            {
-                LogToFile($"Error de E/S al crear archivo de configuración: {ioEx.Message}", "ERROR");
-            }
-            catch (Exception ex)
-            {
-                LogToFile($"Error al crear el archivo de configuración: {ex.Message}\nStack Trace: {ex.StackTrace}", "ERROR");
-            }
-        }
-
-        /// 
-        /// Crea los permisos para leer el archivo.
-        /// 
-        private void SetFilePermissions(string filePath)
-        {
-            try
-            {
-                LogToFile($"Configurando permisos para el archivo: {filePath}", "INFO");
-                FileSecurity fileSecurity = File.GetAccessControl(filePath);
-                string currentUser = WindowsIdentity.GetCurrent().Name;
-
-                LogToFile($"Otorgando permisos al usuario actual: {currentUser}", "INFO");
-                fileSecurity.AddAccessRule(new FileSystemAccessRule(
-                    currentUser,
-                    FileSystemRights.Read | FileSystemRights.Write,
-                    InheritanceFlags.None,
-                    PropagationFlags.None,
-                    AccessControlType.Allow
-                ));
-
-                File.SetAccessControl(filePath, fileSecurity);
-                LogToFile("Permisos configurados correctamente", "INFO");
-            }
-            catch (UnauthorizedAccessException uaEx)
-            {
-                LogToFile($"Error de permisos al configurar permisos del archivo: {uaEx.Message}", "ERROR");
-            }
-            catch (Exception ex)
-            {
-                LogToFile($"Error al configurar permisos del archivo: {ex.Message}", "ERROR");
-            }
-        }
-
         /// 
         /// Registra las sesiones en el archivo.
         /// 
@@ -822,29 +1011,39 @@ namespace analytics_AddIn
         /// 
         public bool DisconnectFromSW()
         {
+            LogToFile("DisconnectFromSW: Iniciando desconexión...", "INFO");
             try
             {
-                LogToFile("DisconnectFromSW: Iniciando desconexión...", "INFO");
-
-                // Detener y liberar el vigilante y los temporizadores.
-                journalFileWatcher?.Dispose();
                 inactivityTimer?.Stop();
                 heartbeatTimer?.Stop();
-                inactivityTimer?.Dispose();
-                heartbeatTimer?.Dispose();
+                if (journalFileWatcher != null)
+                {
+                    journalFileWatcher.EnableRaisingEvents = false; // Es bueno desactivarlo antes de liberarlo.
+                }
 
-                // Si el usuario estaba activo al cerrar, registrar un 'Close' final.
                 if (isUserActive)
                 {
                     RegisterSolidWorksSession("Close");
                 }
+                File.AppendAllText(historyActionLogPath, "EndFile\r\n");
+                GenerateActionSummary();
 
-                // Liberar objetos COM.
-                if (commandManager != null) Marshal.ReleaseComObject(commandManager);
-                if (solidWorksApp != null) Marshal.ReleaseComObject(solidWorksApp);
+                // Desuscribirse de los eventos de SolidWorks.
+                ((SldWorks)solidWorksApp).OnIdleNotify -= new DSldWorksEvents_OnIdleNotifyEventHandler(OnIdleNotifyHandler);
+
+                // Liberar recursos desechables.
+                journalFileWatcher?.Dispose();
+                inactivityTimer?.Dispose();
+                heartbeatTimer?.Dispose();
+
+                // Liberar objetos COM y ponerlos en null para evitar su uso accidental.
+                if (commandManager != null) { Marshal.ReleaseComObject(commandManager); commandManager = null; }
+                if (solidWorksApp != null) { Marshal.ReleaseComObject(solidWorksApp); solidWorksApp = null; }
 
                 GC.Collect();
                 GC.WaitForPendingFinalizers();
+
+                LogToFile("Desconexión de SOLIDWORKS completada.", "INFO");
                 return true;
             }
             catch (Exception ex)
@@ -865,57 +1064,11 @@ namespace analytics_AddIn
 
             LogFilePath = Path.Combine(baseApplicationDataFolder, AppName + "_log.txt");
             ConfigFilePath = Path.Combine(baseApplicationDataFolder, AppName + "_sessions.txt");
+            historyActionLogPath = Path.Combine(baseApplicationDataFolder, "HistoryAction.log");
+            summaryActionLogPath = Path.Combine(baseApplicationDataFolder, "LogAction.log");
             tempFolder = Path.Combine(baseApplicationDataFolder, "temp");
             Directory.CreateDirectory(tempFolder);
-        }
-
-        /// 
-        /// Agregar icono ---- Aun esta en test.
-        ///
-        private string GetIconPathFromRegistry()
-        {
-            try
-            {
-                using (var key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName"))
-                {
-                    if (key != null)
-                    {
-                        string iconPath = key.GetValue("Source")?.ToString();
-                        LogToFile($"Ruta del icono obtenida del registro: {iconPath}", "INFO");
-                        return iconPath;
-                    }
-                    else
-                    {
-                        LogToFile("No se encontró la clave del registro para la ruta del icono.", "WARNING");
-                        return string.Empty;
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine("Error al obtener la ruta del icono del registro: " + ex.Message);
-                LogToFile($"Error al obtener la ruta del icono del registro: {ex.Message}", "ERROR");
-                return string.Empty;
-            }
-        }
-
-        /// 
-        /// Validar que el usuario tenga licencia de analitics.
-        ///
-        private bool ValidateLicense()
-        {
-            try
-            {
-                LogToFile("Iniciando validación de licencia...", "INFO");
-                // Lógica pendiente de implementación
-                LogToFile("Validación de licencia completada (lógica no implementada)", "INFO");
-                return true;
-            }
-            catch (Exception ex)
-            {
-                LogToFile($"Error durante la validación de licencia: {ex.Message}", "ERROR");
-                return false;
-            }
+            LogToFile("Constructor: Rutas inicializadas.", "INFO");
         }
 
         /// 
@@ -1243,12 +1396,14 @@ namespace analytics_AddIn
                     return;
                 }
 
-                if (testUpdate) {
+                if (testUpdate)
+                {
                     VERSION = "1.0.4";
                     cambios = "Test 1";
                     link = "http://localhost/analytics/analytics-v1.0.4.zip";
                 }
-                else {
+                else
+                {
                     VERSION = lastInstaller["Version"]?.ToString();
                     cambios = lastInstaller["ReleaseNotes"]?.ToString();
                     link = lastInstaller["publicDllLink"]?.ToString();
@@ -1286,7 +1441,7 @@ namespace analytics_AddIn
                     // 2. Preparar el actualizador en la carpeta temporal (esto no cambia).
                     string updaterOriginalPath = Path.Combine(rutaInstalacion, "updates.exe");
                     LogToFile($"La ruta updaterOriginalPath: {updaterOriginalPath}", "INFO");
-                    
+
                     if (!File.Exists(updaterOriginalPath)) { /*...manejar error...*/ return; }
 
                     string tempUpdaterDir = Path.Combine(Path.GetTempPath(), "analytics_update");
@@ -1558,6 +1713,7 @@ namespace analytics_AddIn
 
                 // Intentar subir los archivos
                 LogToFile("Intentando subir archivos de registro swxJRNL...", "INFO");
+                LogToFile("--------------------------------------------------------------------------solidworksPath:", solidworksPath);
 
                 await UploadIfExists(solidworksPath, "swxJRNL.swj");
                 await UploadIfExists(solidworksPath, "swxJRNL.bak");
@@ -1918,6 +2074,12 @@ namespace analytics_AddIn
             // Marcamos que ya hemos comenzado, para no volver a ejecutar esto.
             backgroundTasksStarted = true;
             LogToFile("SolidWorks está inactivo (Idle). Iniciando tareas de fondo (actualización, envío de logs, etc.).", "INFO");
+
+            //Inicia el monitoreo del archivo Journal.
+            InitializeJournalMonitoring();
+
+            //Revisa si la sesión anterior tuvo un crash.
+            HandlePreviousSessionCrash();
 
             // Ahora, aquí lanzamos el Task.Run que antes estaba en ConnectToSW.
             // Estando aquí, el hilo tiene un entorno mucho más estable para ejecutarse.
