@@ -211,8 +211,7 @@ namespace analytics_AddIn
             {
                 LogToFile("LoadConfiguration cargado correctamente", "INFO");
 
-                // Limpiar configuración anterior
-
+                
 
                 // Log final de configuración (sin mostrar valores sensibles)
                 LogToFile("-----------------Estado de configuración------------------", "INFO");
@@ -629,9 +628,9 @@ namespace analytics_AddIn
                 // Registramos el inicio de la sesión de actividad.
                 RegisterSolidWorksSession("Open");
 
-                EnsurePreviousHistoryLogIsClosed();
+                //EnsurePreviousHistoryLogIsClosed();
                 // Al iniciar una nueva sesión de actividad, escribimos "StartFile" en el log de historial.
-                File.AppendAllText(historyActionLogPath, "StartFile\r\n");
+                /////////////////////////////////////////File.AppendAllText(historyActionLogPath, "StartFile\r\n");
 
                 // Iniciamos el temporizador de pulsos.
                 heartbeatTimer.Start();
@@ -786,6 +785,86 @@ namespace analytics_AddIn
             catch (Exception ex)
             {
                 LogToFile($"Error al generar el resumen de acciones: {ex.ToString()}", "ERROR");
+            }
+        }
+
+        /// <summary>
+        /// Genera el resumen, cierra el log de historial y mueve ambos archivos a sus carpetas de respaldo.
+        /// </summary>
+        private void FinalizeAndBackupSessionLogs(DateTime backupDate)
+        {
+            try
+            {
+                if (!File.Exists(historyActionLogPath)) return;
+
+                EnsurePreviousHistoryLogIsClosed();
+                GenerateActionSummary();
+
+                string timestamp = backupDate.ToString("yyyy-MM-dd");
+
+                // Mover HistoryAction.log
+                string historyBackupDir = Path.Combine(baseApplicationDataFolder, "History_Backups");
+                string newHistoryPath = Path.Combine(historyBackupDir, $"HistoryAction_{timestamp}.log");
+                File.Move(historyActionLogPath, newHistoryPath);
+                LogToFile($"Archivo de historial respaldado en: {newHistoryPath}", "INFO");
+
+                // Mover LogAction.log (si se creó)
+                if (File.Exists(summaryActionLogPath))
+                {
+                    string summaryBackupDir = Path.Combine(baseApplicationDataFolder, "Summary_Backups");
+                    string newSummaryPath = Path.Combine(summaryBackupDir, $"LogAction_{timestamp}.log");
+                    File.Move(summaryActionLogPath, newSummaryPath);
+                    LogToFile($"Archivo de resumen respaldado en: {newSummaryPath}", "INFO");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogToFile($"Error al finalizar y respaldar los logs: {ex.ToString()}", "ERROR");
+            }
+        }
+
+        /// <summary>
+        /// Revisa al inicio si quedó un HistoryAction.log de una sesión anterior (crash).
+        /// Si es así, lo procesa y lo respalda.
+        /// </summary>
+        private void ManageLogLifecycleOnStartup()
+        {
+            try
+            {
+                // Si el archivo de historial no existe, simplemente creamos uno nuevo para hoy.
+                if (!File.Exists(historyActionLogPath))
+                {
+                    File.WriteAllText(historyActionLogPath, "StartFile\r\n");
+                    LogToFile("Nuevo HistoryAction.log iniciado para la sesión actual.", "INFO");
+                    return;
+                }
+
+                // Si el archivo existe, obtenemos su fecha de última modificación.
+                DateTime lastLogDate = File.GetLastWriteTime(historyActionLogPath).Date;
+                DateTime today = DateTime.Now.Date;
+
+                // Comparamos si el log es de un día anterior.
+                if (lastLogDate < today)
+                {
+                    LogToFile($"Detectado log del día anterior ({lastLogDate:yyyy-MM-dd}). Finalizando y respaldando...", "INFO");
+                    FinalizeAndBackupSessionLogs(lastLogDate); // Usamos la fecha del log para el nombre del respaldo.
+
+                    // Creamos un nuevo log para el día de hoy.
+                    File.WriteAllText(historyActionLogPath, "StartFile\r\n");
+                    LogToFile("Nuevo HistoryAction.log iniciado para la sesión actual.", "INFO");
+                }
+                else
+                {
+                    // Si es del mismo día, solo nos aseguramos de que la sesión anterior esté cerrada
+                    // y añadimos un nuevo bloque StartFile.
+                    LogToFile("Continuando con el HistoryAction.log del día de hoy.", "INFO");
+                    EnsurePreviousHistoryLogIsClosed();
+                    File.AppendAllText(historyActionLogPath, "StartFile\r\n");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogToFile($"Error en ManageLogLifecycleOnStartup: {ex.ToString()}", "ERROR");
             }
         }
         #endregion
@@ -1011,39 +1090,34 @@ namespace analytics_AddIn
         /// 
         public bool DisconnectFromSW()
         {
-            LogToFile("DisconnectFromSW: Iniciando desconexión...", "INFO");
             try
             {
+                LogToFile("DisconnectFromSW: Iniciando desconexión...", "INFO");
+
+                // Detener el monitoreo y los temporizadores.
+                journalFileWatcher?.Dispose();
                 inactivityTimer?.Stop();
                 heartbeatTimer?.Stop();
-                if (journalFileWatcher != null)
-                {
-                    journalFileWatcher.EnableRaisingEvents = false; // Es bueno desactivarlo antes de liberarlo.
-                }
+                inactivityTimer?.Dispose();
+                heartbeatTimer?.Dispose();
 
+                // Si el usuario estaba activo, registrar el 'Close' en el archivo de sesiones .txt.
                 if (isUserActive)
                 {
                     RegisterSolidWorksSession("Close");
                 }
-                File.AppendAllText(historyActionLogPath, "EndFile\r\n");
-                GenerateActionSummary();
 
-                // Desuscribirse de los eventos de SolidWorks.
-                ((SldWorks)solidWorksApp).OnIdleNotify -= new DSldWorksEvents_OnIdleNotifyEventHandler(OnIdleNotifyHandler);
+                // Escribir 'EndFile' en el log de historial para cerrar el último bloque de acciones del día.
+                EnsurePreviousHistoryLogIsClosed();
 
-                // Liberar recursos desechables.
-                journalFileWatcher?.Dispose();
-                inactivityTimer?.Dispose();
-                heartbeatTimer?.Dispose();
+                // ¡YA NO GENERAMOS RESUMEN NI RESPALDAMOS AQUÍ!
 
-                // Liberar objetos COM y ponerlos en null para evitar su uso accidental.
+                // Liberar objetos COM.
                 if (commandManager != null) { Marshal.ReleaseComObject(commandManager); commandManager = null; }
                 if (solidWorksApp != null) { Marshal.ReleaseComObject(solidWorksApp); solidWorksApp = null; }
 
                 GC.Collect();
                 GC.WaitForPendingFinalizers();
-
-                LogToFile("Desconexión de SOLIDWORKS completada.", "INFO");
                 return true;
             }
             catch (Exception ex)
@@ -1060,14 +1134,25 @@ namespace analytics_AddIn
         {
             string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
             baseApplicationDataFolder = Path.Combine(localAppData, AppName);
-            Directory.CreateDirectory(baseApplicationDataFolder);
 
+            string historyBackupFolder = Path.Combine(baseApplicationDataFolder, "History_Backups");
+            string summaryBackupFolder = Path.Combine(baseApplicationDataFolder, "Summary_Backups");
+
+            // Creamos todas las carpetas necesarias si no existen.
+            Directory.CreateDirectory(baseApplicationDataFolder);
+            Directory.CreateDirectory(historyBackupFolder);
+            Directory.CreateDirectory(summaryBackupFolder);
+
+            // Las rutas de los archivos de la sesión ACTUAL apuntan directamente a la carpeta base.
             LogFilePath = Path.Combine(baseApplicationDataFolder, AppName + "_log.txt");
             ConfigFilePath = Path.Combine(baseApplicationDataFolder, AppName + "_sessions.txt");
+            tempFolder = Path.Combine(baseApplicationDataFolder, "temp");
             historyActionLogPath = Path.Combine(baseApplicationDataFolder, "HistoryAction.log");
             summaryActionLogPath = Path.Combine(baseApplicationDataFolder, "LogAction.log");
-            tempFolder = Path.Combine(baseApplicationDataFolder, "temp");
+
+
             Directory.CreateDirectory(tempFolder);
+        
             LogToFile("Constructor: Rutas inicializadas.", "INFO");
         }
 
@@ -1442,9 +1527,26 @@ namespace analytics_AddIn
                     string updaterOriginalPath = Path.Combine(rutaInstalacion, "updates.exe");
                     LogToFile($"La ruta updaterOriginalPath: {updaterOriginalPath}", "INFO");
 
-                    if (!File.Exists(updaterOriginalPath)) { /*...manejar error...*/ return; }
+                    if (!File.Exists(updaterOriginalPath)) { return;}
 
                     string tempUpdaterDir = Path.Combine(Path.GetTempPath(), "analytics_update");
+                    LogToFile($"La ruta updaterOriginalPath: {tempUpdaterDir}", "INFO");
+
+                    if (Directory.Exists(tempUpdaterDir))
+                    {
+                        LogToFile("Se encontró la carpeta temporal, procediendo a eliminarla...", "INFO");
+
+                        try
+                        {
+                            Directory.Delete(tempUpdaterDir, true); // Elimina todo el contenido
+                            LogToFile("Carpeta eliminada exitosamente.", "INFO");
+                        }
+                        catch (Exception ex)
+                        {
+                            LogToFile($"Error al eliminar la carpeta: {ex.Message}", "ERROR");
+                        }
+                    }
+
                     Directory.CreateDirectory(tempUpdaterDir);
 
                     string[] requiredFiles = { "updates.exe", "Newtonsoft.Json.dll" };
@@ -1713,8 +1815,6 @@ namespace analytics_AddIn
 
                 // Intentar subir los archivos
                 LogToFile("Intentando subir archivos de registro swxJRNL...", "INFO");
-                LogToFile("--------------------------------------------------------------------------solidworksPath:", solidworksPath);
-
                 await UploadIfExists(solidworksPath, "swxJRNL.swj");
                 await UploadIfExists(solidworksPath, "swxJRNL.bak");
                 await UploadIfExists(baseApplicationDataFolder, AppName + "_log.txt");
@@ -2065,24 +2165,21 @@ namespace analytics_AddIn
         /// </summary>
         private int OnIdleNotifyHandler()
         {
-            // Si ya hemos ejecutado nuestras tareas, no hacemos nada más.
-            if (backgroundTasksStarted)
-            {
-                return 0;
-            }
-
-            // Marcamos que ya hemos comenzado, para no volver a ejecutar esto.
+            if (backgroundTasksStarted) return 0;
             backgroundTasksStarted = true;
-            LogToFile("SolidWorks está inactivo (Idle). Iniciando tareas de fondo (actualización, envío de logs, etc.).", "INFO");
 
-            //Inicia el monitoreo del archivo Journal.
+            LogToFile("SolidWorks inactivo (Idle). Iniciando tareas de fondo...", "INFO");
+
+            // --- NUEVA LÓGICA DE GESTIÓN DE LOGS DIARIOS ---
+            ManageLogLifecycleOnStartup();
+
+            // Inicia el monitoreo del archivo Journal para la sesión actual.
             InitializeJournalMonitoring();
 
-            //Revisa si la sesión anterior tuvo un crash.
+            // Revisa si la sesión .txt anterior tuvo un crash.
             HandlePreviousSessionCrash();
 
-            // Ahora, aquí lanzamos el Task.Run que antes estaba en ConnectToSW.
-            // Estando aquí, el hilo tiene un entorno mucho más estable para ejecutarse.
+            // Ejecuta las tareas de red en segundo plano.
             Task.Run(async () => {
                 if (IsInternetAvailable())
                 {
@@ -2092,11 +2189,11 @@ namespace analytics_AddIn
                 }
             });
 
-            // Nos damos de baja del evento para no volver a ser llamados innecesariamente.
+            // Nos damos de baja del evento para no volver a ser llamados.
             ((SldWorks)solidWorksApp).OnIdleNotify -= new DSldWorksEvents_OnIdleNotifyEventHandler(OnIdleNotifyHandler);
-            LogToFile("Tareas de fondo iniciadas. Dando de baja la suscripción al evento OnIdleNotify.", "INFO");
+            LogToFile("Tareas de fondo iniciadas. Desuscripción de OnIdleNotify completada.", "INFO");
 
-            return 0; // Se requiere devolver un entero.
+            return 0;
         }
     }
 
