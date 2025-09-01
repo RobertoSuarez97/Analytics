@@ -1,22 +1,21 @@
-﻿using System;
+﻿using IWshRuntimeLibrary;
+using Microsoft.Win32;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
 using System.IO;
 using System.IO.Compression;
+using System.Linq;
 using System.Net;
+using System.Net.Http;
+using System.Net.NetworkInformation;
+using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
-using System.Diagnostics;
-using System.Net.Http;
-// para ponerlo en el menú de windows
-using IWshRuntimeLibrary;
-// para el registro
-using Microsoft.Win32;
 using System.Xml.Linq;
-using Newtonsoft.Json.Linq;
-using System.Text;
-using Newtonsoft.Json;
-using System.Net.NetworkInformation;
-using System.Linq;
 
 namespace instalador
 {
@@ -25,143 +24,310 @@ namespace instalador
         private const string AppName = "analytics";
         private static readonly HttpClient client = new HttpClient();
         WebClient wc = new WebClient();
-        List<Panel> paginas = new List<Panel>(); // para los paneles
-        Panel panelCheckBoxContainer = new Panel();
-        System.Windows.Forms.CheckBox chk = new System.Windows.Forms.CheckBox();
-        int indice = 0; // indice del panel
+        List<Panel> paginas = new List<Panel>();
+        int indice = 0;
         string ruta = "", pathToExe = "", temp = "";
         string VERSION = "", AssemblyVERSION = "", ARCHIVO = "", URL = "", LINK = "";
-        // datos que se guardan
         string email = "", password = "", UserID = "", deviceID = "", deviceAlias = "", deviceName = "", code = "", osVersion = "", deviceMAC = "", swActivies = "", campus = "";
         string mode = "prod";
         string DllAddIn = "analytics_AddIn";
         private Dictionary<string, int> customerMapping = new Dictionary<string, int>();
-        private int selectedCustomerID = 0; // Aquí guardarás el CustomerID del seleccionado
+        private int selectedCustomerID = 0;
         private string LogFilePath = GetSource() + "\\" + AppName + "\\Instalador_log.txt";
 
         public frminstalador()
         {
+            indice = 0;            
             InitializeComponent();
-            // No llames async aquí
             this.Load += frminstalador_Load;
         }
 
         private async void frminstalador_Load(object sender, EventArgs e)
         {
-            await Task.Delay(100); // opcional, solo si quieres darle tiempo al form de cargar
+            this.rtbTerminos.SelectAll();
+            this.rtbTerminos.SelectionAlignment = HorizontalAlignment.Center;
+            this.rtbTerminos.Select(0, 0);
+            await Task.Delay(100);
             await setValoresIniciales();
         }
 
-        /////////////////////////////////////////////////////////////////////------------Acotaciones-----------///////////////////////////////////////////////////////////////////////
-        // Valores iniciales
-        // **Carpeta de descarga
-        // **Seteo de instalacion y descomprimir archivo
+        //------------------ LÓGICA PRINCIPAL ------------------//
         private async Task setValoresIniciales()
         {
-            // primero de todo comprobamos la última versión
             getAssemblyVersion();
             await getVersion();
 
-            // ahora detectamos el link al archivo
-
             ARCHIVO = AppName + "-v" + AssemblyVERSION + ".zip";
-            
-            // URL = this.LINK + "/" + AppName + "/" + ARCHIVO;
             URL = this.LINK;
-            // MessageBox.Show(URL);
-            txtmenuinicio.Text = AppName;
 
-            // añadimos a la lista de páginas
             paginas.Add(lyrBienvenida);
             paginas.Add(lyrAviso);
             paginas.Add(lyrValidacion);
             paginas.Add(lyrConfigUsuario);
             paginas.Add(lyrSeleccion);
-            paginas.Add(panel3);
-            paginas.Add(panel4);
-            paginas.Add(panel5);
-            paginas.Add(lyrNotUser);
+            paginas.Add(lyrInstalacion);
+            paginas.Add(lyrConfirmacion);
 
-            // navegamos a la primera (Bienvenida)
             indice = 0;
             pagina();
 
-            // ruta predeterminada de programas ("C:\Program Files\")
             ruta = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
-            txtruta.Text = ruta;
+            txtruta.Text = Path.Combine(ruta, AppName);
 
-            // para la descarga del programa e registros en el regedit
             wc.DownloadProgressChanged += (s, e) =>
             {
                 pbinstalacion.Value = e.ProgressPercentage;
+                lbprogreso.Text = $"Descargando archivos ({e.ProgressPercentage}%)";
             };
 
-            wc.DownloadFileCompleted += (s, e) =>
+            wc.DownloadFileCompleted += async (s, e) =>
             {
                 if (!e.Cancelled)
                 {
-                    // si no se ha cancelado, extraemos el archivo en la carpeta de instalación
-
-                    string carpeta = Path.Combine(ruta, AppName);
+                    string carpeta = txtruta.Text;
                     if (Directory.Exists(carpeta)) eliminarCarpeta(carpeta);
                     Directory.CreateDirectory(carpeta);
+                    ZipFile.ExtractToDirectory(temp, carpeta);
 
-                    rtbprogreso.AppendText("\nExtrayendo/copiando archivos");
-                    ZipFile.ExtractToDirectory(temp, carpeta); // extraemos el archivo
-
-                    // ✅ REGISTRAR LA DLL AUTOMÁTICAMENTE
                     string dllPath = Path.Combine(carpeta, "Dll", DllAddIn + ".dll");
                     if (System.IO.File.Exists(dllPath))
                     {
-                        rtbprogreso.AppendText("\nRegistrando la DLL...");
                         RegisterDLL(dllPath);
                     }
 
-                    rtbprogreso.AppendText("\nAgregando al registro...");
-                    // agregando al menú de inicio
-                    pathToExe = Path.Combine(carpeta, AppName + ".exe");
-
-                    // la agregamos al registro
-                    RegistryKey __key = Registry.LocalMachine.OpenSubKey("Software", true)
-                    .OpenSubKey("Microsoft", true).OpenSubKey("Windows", true)
-                    .OpenSubKey("CurrentVersion", true);
-
-                    RegistryKey key = __key.OpenSubKey("App Paths", true);
-
-                    key.CreateSubKey(AppName + ".exe", true);
-                    key = key.OpenSubKey(AppName + ".exe", true);
-                    key.SetValue("", Path.Combine(carpeta, AppName + ".exe"));
-                    key.SetValue("Path", carpeta);
-
-                    // lo mismo para desinstalarla
-                    RegistryKey unins = __key.OpenSubKey("Uninstall", true);
-                    unins.CreateSubKey(AppName, true);
-                    unins = unins.OpenSubKey(AppName, true);
-
-                    unins.SetValue("DisplayName", AppName);
-                    unins.SetValue("DisplayVersion", VERSION);
-                    unins.SetValue("UninstallString", Path.Combine(carpeta, "uninstall.exe"));
-
+                    lbprogreso.Text = "Registro y finalización...";
                     pbinstalacion.Value = pbinstalacion.Maximum;
 
-                    // Llamamos a la función que agrega el registro de usuario
                     registerUserRegedit();
 
-                    MessageBox.Show("Instalación completada");
-                    Environment.Exit(0);
+                    await Task.Delay(1000);
+                    indice = paginas.IndexOf(lyrConfirmacion);
+                    pagina();
                 }
             };
         }
 
+        private void pagina()
+        {
+            paginas[indice].BringToFront();
+            switch (indice)
+            {
+                case 0:
+                    btnatras.Enabled = true;
+                    btnsiguiente.Enabled = true;
+                    btnsiguiente.Text = "Siguiente";
+                    btnatras.Text = "Cancelar";
+                    break;
+                case 1:
+                    ckbAviso.Checked = false;
+                    btnatras.Enabled = true;
+                    btnsiguiente.Enabled = false;
+                    btnatras.Text = "Atras";
+                    btnsiguiente.Text = "Siguiente";
+                    break;
+                case 2:
+                    btnatras.Enabled = true;
+                    btnsiguiente.Enabled = true;
+                    btnsiguiente.Text = "Siguiente";
+                    break;
+                case 3:
+                    btnatras.Enabled = true;
+                    btnsiguiente.Enabled = true;
+                    btnsiguiente.Text = "Siguiente";
+                    break;
+                case 4:
+                    btnatras.Enabled = true;
+                    btnsiguiente.Enabled = true;
+                    btnsiguiente.Text = "Instalar";
+                    break;
+                case 5:
+                    btnatras.Enabled = true;
+                    btnsiguiente.Text = "Instalando...";
+                    btnsiguiente.Enabled = false;
+                    btnatras.Text = "Cancelar";
+                    break;
+                case 6:
+                    btnatras.Enabled = false;
+                    btnsiguiente.Text = "Cerrar";
+                    btnsiguiente.Enabled = true;
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        public static async Task<string> createDevice(string json)
+        {
+            string token = await GetToken("", "", true);
+            string analyticsUrl = "https://api-ncsw.xpertme.com/api/createDevice";
+
+            var request = new HttpRequestMessage(HttpMethod.Post, analyticsUrl);
+            request.Headers.Add("authorization", $"{token}");
+
+            var requestBody = json;
+            request.Content = new StringContent(requestBody, Encoding.UTF8, "application/json");
+
+            try
+            {
+                HttpResponseMessage response = await client.SendAsync(request);
+                response.EnsureSuccessStatusCode();
+                string responseBody = await response.Content.ReadAsStringAsync();
+                JObject jsonResponse = JObject.Parse(responseBody);
+                string insertId = jsonResponse["insertId"]?.ToString() ?? null;
+
+                return insertId;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error al obtener los datos--: {ex.Message}");
+                return null;
+            }
+        }
+
+        private async void btnsiguiente_Click(object sender, EventArgs e)
+        {
+            if (indice == 1 && !ckbAviso.Checked) return;
+
+            if (indice == 2)
+            {
+                txtDevice.Text = Environment.MachineName;
+                if (!await getUserData()) { return; }
+            }
+
+            if (indice == 3)
+            {
+                email = txtEmailValid.Text;
+                deviceAlias = txtDevice.Text;
+                code = selectedCustomerID.ToString();
+
+                GenerarAcordeonDeActividades();
+            }
+
+            if (indice == 4) // Capturamos las actividades seleccionadas y creamos el dispositivo
+            {
+                var seleccionados = ObtenerCheckBoxesSeleccionados();
+                string json = JsonConvert.SerializeObject(seleccionados, Formatting.Indented).Replace("\r\n", "");
+                swActivies = json;
+
+                if (seleccionados.Count == 0)
+                {
+                    MessageBox.Show("Debes seleccionar al menos una actividad.", "Actividades requeridas", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return; // Detenemos la ejecución para que el usuario pueda seleccionar una actividad
+                }
+
+
+                string format = "yyyy-MM-dd HH:mm:ss";
+                string Currenttinme = DateTime.Now.ToString(format);
+                deviceMAC = GetMacAddress();
+                osVersion = GetOperatingSystem();
+                deviceName = Environment.MachineName;
+
+                var requestBodyData = new
+                {
+                    code = "r5ncccmGhzLG",
+                    created_at = Currenttinme,
+                    UserEmail = email,
+                    userID = UserID,
+                    appCustomerID = code,
+                    deviceAlias = deviceAlias,
+                    deviceName = deviceName,
+                    deviceMAC = deviceMAC,
+                    osVersion = osVersion,
+                    swActivies = swActivies,
+                    Campus = campus,
+                    Career = "null"
+                };
+                string jsonString = JsonConvert.SerializeObject(requestBodyData);
+                deviceID = await createDevice(jsonString);
+            }
+
+            if (btnsiguiente.Text == "Instalar")
+            {
+                temp = Path.Combine(Path.GetTempPath(), AppName);
+                if (Directory.Exists(temp)) eliminarCarpeta(temp);
+                Directory.CreateDirectory(temp);
+                temp = Path.Combine(temp, ARCHIVO);
+
+                lbprogreso.Text = "Descargando archivos...";
+                btnsiguiente.Enabled = false;
+                btnatras.Text = "Cancelar";
+
+                wc.DownloadFileAsync(new Uri(URL), temp);
+
+                indice++;
+                pagina();
+                return;
+            }
+
+            if (btnsiguiente.Text == "Cerrar")
+            {
+                Environment.Exit(0);
+            }
+
+            indice++;
+            pagina();
+        }
+
+        private void btnatras_Click(object sender, EventArgs e)
+        {
+            if (indice == 0)
+            {
+                var d = MessageBox.Show("¿Seguro que quieres salir?", "Instalación", MessageBoxButtons.YesNo, MessageBoxIcon.Asterisk);
+                if (d == DialogResult.Yes)
+                {
+                    Environment.Exit(0);
+                    return;
+                }
+                else
+                {
+                    indice = 0;
+                    pagina();
+                    return;
+                }
+            }
+
+            if (btnatras.Text == "Cancelar" && indice != 0)
+            {
+                var d = MessageBox.Show("¿Seguro que quieres salir?", "Instalación", MessageBoxButtons.YesNo, MessageBoxIcon.Asterisk);
+                if (d == DialogResult.Yes)
+                {
+                    if (wc.IsBusy)
+                    {
+                        wc.CancelAsync();                        
+                    }
+                    Environment.Exit(0);
+                    return;
+                }
+                else
+                {
+                    indice = 5;
+                    pagina();
+                    return;
+                }
+            }
+            if (indice == paginas.IndexOf(lyrConfirmacion))
+            {
+                return;
+            }
+            --indice;
+            pagina();
+        }
+
+        private void ckbAviso_CheckedChanged(object sender, EventArgs e)
+        {
+            btnsiguiente.Enabled = ckbAviso.Checked;
+        }
+
+        //------------------ MÉTODOS AUXILIARES ------------------//
         public void registerUserRegedit()
         {
             string Keypath1 = @"SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName";
 
             try
             {
-                RegistryKey Key1 = Registry.LocalMachine.CreateSubKey(Keypath1);
-                Key1.SetValue("CustomerID", code);
-                Key1.Close();
+                RegistryKey key1 = Registry.LocalMachine.CreateSubKey(Keypath1);
+                key1.SetValue("CustomerID", code);
+                key1.Close();
 
                 RegistryKey key2 = Registry.LocalMachine.CreateSubKey(Keypath1);
                 key2.SetValue("UserID", UserID);
@@ -188,14 +354,12 @@ namespace instalador
             }
         }
 
-        // ✅ FUNCIÓN PARA REGISTRAR LA DLL AUTOMÁTICAMENTE
         private void RegisterDLL(string dllPath)
         {
             try
             {
                 string regasmPath = @"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\RegAsm.exe";
                 string argument = $"\"{dllPath}\" /tlb /codebase";
-
                 ProcessStartInfo startInfo = new ProcessStartInfo(regasmPath, argument)
                 {
                     UseShellExecute = false,
@@ -209,8 +373,6 @@ namespace instalador
                     process.Start();
                     string output = process.StandardOutput.ReadToEnd();
                     process.WaitForExit();
-
-                    rtbprogreso.AppendText("\nDLL registrada correctamente.");
                 }
             }
             catch (Exception ex)
@@ -219,307 +381,6 @@ namespace instalador
             }
         }
 
-        public void GenerarCheckBoxes()
-        {
-            // Limpiar los controles previos del panel
-            //lyrSeleccion.Controls.Clear();
-            List<string> opciones = new List<string>
-            {
-                "Diseño Estructural",
-                "Diseño Aeronáutico",
-                "Diseño de moldes",
-                "Diseño de dispositivos médicos",
-                "Diseño de herramientas",
-                "Diseño de equipos industriales",
-                "Diseño de productos de consumo",
-                "Diseño de envases",
-                "Diseño Automotriz",
-                "Diseño de empaques",
-                "Diseño de maquinaria",
-                "Diseño de muebles",
-                "Generación de planos 2D"
-            };
-
-            // Crear un Panel contenedor
-            panelCheckBoxContainer.BackColor = System.Drawing.Color.White; // Fondo blanco
-            panelCheckBoxContainer.AutoScroll = true; // Permitir scroll si es necesario
-            panelCheckBoxContainer.Size = new System.Drawing.Size(900, 400); // Ajusta el tamaño según sea necesario
-            panelCheckBoxContainer.Location = new System.Drawing.Point(20, 150); // Posición dentro de lyrSeleccion
-
-            int yPos = 10; // Posición inicial dentro del panel
-            int xPos = 10;
-            int columnHeight = 330; // Ajustar según el tamaño del panel
-            int columnWidth = 450; // Ancho de cada columna
-
-            foreach (var opcion in opciones)
-            {
-                // Si se llega al límite de la columna, mover a la siguiente
-                if (yPos >= columnHeight)
-                {
-                    xPos += columnWidth; // Mover a la siguiente columna
-                    yPos = 10; // Reiniciar la posición vertical
-                }
-
-                // Crear un nuevo CheckBox en cada iteración
-                CheckBox chk = new CheckBox();
-                chk.Text = opcion;
-                chk.Size = new System.Drawing.Size(400, 40);
-                chk.Font = new System.Drawing.Font("Microsoft Sans Serif", 12F);
-                chk.Location = new System.Drawing.Point(xPos, yPos);
-                chk.BackColor = System.Drawing.Color.White;
-
-                // Agregar el CheckBox al Panel contenedor
-                panelCheckBoxContainer.Controls.Add(chk);
-
-                // Incrementar la posición vertical
-                yPos += 40;
-            }
-
-            // Agregar el Panel contenedor a lyrSeleccion
-            lyrSeleccion.Controls.Add(panelCheckBoxContainer);
-        }
-
-        private List<Dictionary<string, string>> ObtenerCheckBoxesSeleccionados()
-        {
-            List<Dictionary<string, string>> actividadesSeleccionadas = new List<Dictionary<string, string>>();
-
-            foreach (Control control in panelCheckBoxContainer.Controls)
-            {
-                // Validar primero si es un CheckBox
-                if (control is CheckBox)
-                {
-                    CheckBox chk = (CheckBox)control;
-
-                    // Ahora validar si está seleccionado
-                    if (chk.Checked)
-                    {
-                        actividadesSeleccionadas.Add(new Dictionary<string, string>
-            {
-                { "activiti", chk.Text }
-            });
-                    }
-                }
-            }
-
-            return actividadesSeleccionadas;
-        }
-
-        private void ckbAviso_CheckedChanged(object sender, EventArgs e)
-        {
-            // código para (no) aceptar la licencia
-            if (ckbAviso.Checked)
-            {
-                // no la acepta
-                btnsiguiente.Enabled = true;
-            }
-            else btnsiguiente.Enabled = false;
-        }
-
-        public static string GetMacAddress()
-        {
-            try
-            {
-                // Obtiene todas las interfaces de red
-                var networkInterfaces = NetworkInterface.GetAllNetworkInterfaces();
-
-                // Filtra la interfaz activa que esté conectada y no sea loopback
-                var activeInterface = networkInterfaces
-                    .FirstOrDefault(nic => nic.OperationalStatus == OperationalStatus.Up &&
-                                           nic.NetworkInterfaceType != NetworkInterfaceType.Loopback);
-
-                // Si encontró una interfaz activa, retorna su dirección MAC
-                if (activeInterface != null)
-                {
-                    return string.Join(":", activeInterface.GetPhysicalAddress()
-                        .GetAddressBytes()
-                        .Select(b => b.ToString("X2")));
-                }
-                else
-                {
-                    return "No se encontró ninguna interfaz de red activa.";
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error al obtener la MAC Address: {ex.Message}");
-                return "Error al obtener la MAC Address";
-            }
-        }
-
-        // Obtiene el sistema operativo del equipo
-        public string GetOperatingSystem()
-        {
-
-            string windowsProductName = string.Empty;
-
-            RegistryKey key = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion");
-
-            if (key != null)
-            {
-                windowsProductName = key.GetValue("ProductName")?.ToString();
-                key.Close();
-                return windowsProductName;
-            }
-            else
-            {
-                return "ERROR!!";
-            }
-
-
-        }
-
-        private void lblLikRegistro_Click(object sender, EventArgs e)
-        {
-            Process.Start(new ProcessStartInfo
-            {
-                FileName = "https://accounts.xpertme.com/user/registerView",
-                UseShellExecute = true // Necesario para evitar problemas con seguridad en algunas versiones de Windows
-            });
-        }
-
-        private void lblNotUserClick_click(object sender, EventArgs e)
-        {
-            Process.Start(new ProcessStartInfo
-            {
-                FileName = "https://accounts.xpertme.com/user/registerView",
-                UseShellExecute = true // Necesario para evitar problemas con seguridad en algunas versiones de Windows
-            });
-        }
-
-        private string ObtenerRutaDesdeRegistro()
-        {
-            string source = null;
-            try
-            {
-                RegistryKey key = Registry.LocalMachine.OpenSubKey("SYSTEM\\CurrentControlSet\\Control\\ComputerName\\ComputerName");
-                if (key != null)
-                {
-                    object o = key.GetValue("Source");
-                    source = o.ToString();
-                }
-            }
-            catch (Exception e)
-            {
-                Debug.Print("Error de obtener usserID!!! " + e.ToString());
-            }
-            return source;
-        }
-
-        /////////////////////////////////////////////////////////////////////------------Obtener tokens-----------///////////////////////////////////////////////////////////////////////
-        public static async Task<string> GetToken(string authHeader, string scope, bool useLocalAuth = false)
-        {
-            // Forzar el uso de TLS 1.2 para evitar problemas de seguridad
-            System.Net.ServicePointManager.SecurityProtocol = System.Net.SecurityProtocolType.Tls12;
-
-            string tokenUrl;
-            if (useLocalAuth)
-            {
-                tokenUrl = "https://api-ncsw.xpertme.com/api/auth"; // URL local
-            }
-            else
-            {
-                tokenUrl = "https://api-academy.xpertcad.com/v2/system/oauth/token"; // URL de Xpertme
-            }
-
-            using (HttpClient client = new HttpClient())
-            {
-                var request = new HttpRequestMessage(HttpMethod.Post, tokenUrl);
-
-                // Si es la URL de Xpertme, agregamos el header de autorización
-                if (!useLocalAuth)
-                {
-                    request.Headers.Add("Authorization", $"Basic {authHeader}");
-                    request.Content = new FormUrlEncodedContent(new[]
-                    {
-                new KeyValuePair<string, string>("grant_type", "client_credentials"),
-                new KeyValuePair<string, string>("scope", scope)
-            });
-                }
-                else
-                {
-                    // Si es la URL local, no es necesario el header de autorización ni los datos
-                    request.Content = new StringContent(""); // Se puede ajustar si la API espera otros datos
-                }
-
-                try
-                {
-                    HttpResponseMessage response = await client.SendAsync(request);
-                    response.EnsureSuccessStatusCode();
-
-                    string responseBody = await response.Content.ReadAsStringAsync();
-                    JObject jsonObject = JObject.Parse(responseBody);
-                    string accessToken = jsonObject["accessToken"]?.ToString();
-                    if (string.IsNullOrEmpty(accessToken))
-                    {
-                        accessToken = jsonObject["token"]?.ToString();  // Si no se encuentra "accessToken", verifica "token"
-                    }
-
-                    if (string.IsNullOrEmpty(accessToken))
-                    {
-                        throw new Exception("Token no encontrado");
-                    }
-                    return accessToken;
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Error al obtener el token en petición GetToken: {ex}");
-                    return null;
-                }
-            }
-        }
-
-        /////////////////////////////////////////////////////////////////////------------Obtener version actual-----------///////////////////////////////////////////////////////////////////////
-        public async Task getVersion()
-        {
-            string token = await GetToken("YW5hbHl0aWNzX3N3OlRtMFF6QTlR", "analytics:installers:get");
-            if (token != null)
-            {
-                string response = await getAnalyticsInstallers(token);
-                JObject jsonObject = JObject.Parse(response);
-                this.LINK = jsonObject["data"]?["lastInstaller"]?["publicDllLink"]?.ToString();
-                this.VERSION = jsonObject["data"]?["lastInstaller"]?["Version"]?.ToString();
-                Text = $"Instalación Xpertme Analytics {VERSION}";
-            }
-            else
-            {
-                Console.WriteLine("No se pudo obtener el token desde get version.");
-            }
-        }
-
-        private void getAssemblyVersion()
-        {
-            System.Reflection.Assembly assembly = System.Reflection.Assembly.GetExecutingAssembly();
-            System.Diagnostics.FileVersionInfo fvi = System.Diagnostics.FileVersionInfo.GetVersionInfo(assembly.Location);
-            this.AssemblyVERSION = fvi.FileVersion;
-            lbversion.Text = AssemblyVERSION;
-            
-        }
-
-        public static async Task<string> getAnalyticsInstallers(string token)
-        {
-            string analyticsUrl = "https://api-academy.xpertcad.com/v2/analytics/users/getAnalyticsInstallers";
-            var request = new HttpRequestMessage(HttpMethod.Post, analyticsUrl);
-            request.Headers.Add("Authorization", $"Bearer {token}");
-
-            // El encabezado "Content-Type" se define dentro de `StringContent`, no en `Headers`
-            var requestBody = "{ \"mode\": \"dev\" }";
-            request.Content = new StringContent(requestBody, Encoding.UTF8, "application/json");
-
-            try
-            {
-                HttpResponseMessage response = await client.SendAsync(request);
-                response.EnsureSuccessStatusCode();
-                string responseBody = await response.Content.ReadAsStringAsync();
-                return responseBody;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error al obtener los datos//: {ex.Message}");
-                return null;
-            }
-        }
-
-        /////////////////////////////////////////////////////////////////////------------Validacion de usuario-----------///////////////////////////////////////////////////////////////////////
         private async Task<bool> getUserData()
         {
             if (string.IsNullOrWhiteSpace(txtEmailValid.Text) || string.IsNullOrWhiteSpace(txtContraseña.Text))
@@ -532,21 +393,17 @@ namespace instalador
 
             if (string.IsNullOrEmpty(status) || status == "0")
             {
-                indice = 8;
-                pagina();
+                MessageBox.Show("No se encontró tu cuenta. Por favor, verifica tus datos o regístrate.", "Usuario no encontrado", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return false;
             }
 
             if (status == "-1")
             {
-                // Seteamos valores
                 code = "null";
                 campus = "null";
 
                 lblInstitucion.Visible = false;
                 cbInstitucion.Visible = false;
-                lblCode.Visible = false;
-                txtCode.Visible = false;
                 return true;
             }
 
@@ -554,11 +411,8 @@ namespace instalador
             {
                 lblInstitucion.Visible = true;
                 cbInstitucion.Visible = true;
-                lblCode.Visible = false;
-                txtCode.Visible = false;
                 return true;
             }
-
             return true;
         }
 
@@ -584,7 +438,6 @@ namespace instalador
 
                 var jsonBody = JsonConvert.SerializeObject(requestBody);
                 var content = new StringContent(jsonBody, Encoding.UTF8, "application/json");
-
                 var request = new HttpRequestMessage(HttpMethod.Post, requestUrl)
                 {
                     Content = content
@@ -600,12 +453,7 @@ namespace instalador
                     JObject jsonObject = JObject.Parse(responseText);
                     string statusCustomer = jsonObject["data"]?["hasCustomer"]?.ToString();
 
-                    LogToFile(jsonObject.ToString(Newtonsoft.Json.Formatting.None));
-
-                    if (string.IsNullOrEmpty(statusCustomer))
-                    {
-                        return "0"; // No existe hasCustomer → 0
-                    }
+                    if (statusCustomer == "0" || string.IsNullOrEmpty(statusCustomer)) return "0";
 
                     UserID = jsonObject["data"]?["ac_UserID"]?.ToString();
                     customerMapping.Clear();
@@ -614,32 +462,30 @@ namespace instalador
                     {
                         string customerName = customer["CustomerName"]?.ToString();
                         string customerIDStr = customer["CustomerID"]?.ToString();
-
                         if (!string.IsNullOrEmpty(customerName))
                         {
                             customerNames.Add(customerName);
-                            customerMapping[customerName] = int.Parse(customerIDStr); // Mapeo del nombre al ID
+                            customerMapping[customerName] = int.Parse(customerIDStr);
                         }
                     }
 
-                    // Actualizar el ComboBox en el hilo de la UI
                     cbInstitucion.Invoke((MethodInvoker)delegate
                     {
-                        cbInstitucion.Items.Clear(); // Limpiar el ComboBox antes de llenarlo
+                        cbInstitucion.Items.Clear();
                         cbInstitucion.Items.AddRange(customerNames.ToArray());
                         if (cbInstitucion.Items.Count > 0)
                         {
-                            cbInstitucion.SelectedIndex = 0; // Seleccionar el primer valor por defecto
+                            cbInstitucion.SelectedIndex = 0;
                             campus = cbInstitucion.SelectedItem.ToString();
-                            selectedCustomerID = customerMapping[campus]; // Guardar el CustomerID asociado
-                        } else
+                            selectedCustomerID = customerMapping[campus];
+                        }
+                        else
                         {
                             campus = null;
                             selectedCustomerID = -1;
                         }
                     });
 
-                    // Manejar cambios en la selección del ComboBox
                     cbInstitucion.SelectedIndexChanged += (s, e) =>
                     {
                         campus = cbInstitucion.SelectedItem.ToString();
@@ -649,24 +495,10 @@ namespace instalador
                         }
                     };
 
+                    if (statusCustomer == "-1") return statusCustomer;
+                    if (statusCustomer == "1") return "1";
 
-                    if (string.IsNullOrEmpty(statusCustomer))
-                    {
-                        return "0"; // No existe hasCustomer → 0
-                    }
-                    else if (statusCustomer == "-1")
-                    {
-                        return statusCustomer; // Usuario autodidacta → null
-                    }
-                    else if (statusCustomer == "1")
-                    {
-                        // Ya estamos llenando el ComboBox arriba
-                        return "1";
-                    }
-                    else
-                    {
-                        return "0"; // Cualquier otro caso
-                    }
+                    return "0";
                 }
                 catch (Exception ex)
                 {
@@ -675,19 +507,93 @@ namespace instalador
                 }
             }
         }
-       
 
-        /////////////////////////////////////////////////////////////////////------------Create device-----------///////////////////////////////////////////////////////////////////////
-        public static async Task<string> createDevice(string json)
+        public static async Task<string> GetToken(string authHeader, string scope, bool useLocalAuth = false)
         {
-            string token = await GetToken("", "", true);
-            string analyticsUrl = "https://api-ncsw.xpertme.com/api/createDevice";
+            System.Net.ServicePointManager.SecurityProtocol = System.Net.SecurityProtocolType.Tls12;
 
+            string tokenUrl;
+            if (useLocalAuth)
+            {
+                tokenUrl = "https://api-ncsw.xpertme.com/api/auth";
+            }
+            else
+            {
+                tokenUrl = "https://api-academy.xpertcad.com/v2/system/oauth/token";
+            }
+
+            using (HttpClient client = new HttpClient())
+            {
+                var request = new HttpRequestMessage(HttpMethod.Post, tokenUrl);
+                if (!useLocalAuth)
+                {
+                    request.Headers.Add("Authorization", $"Basic {authHeader}");
+                    request.Content = new FormUrlEncodedContent(new[]
+                    {
+                        new KeyValuePair<string, string>("grant_type", "client_credentials"),
+                        new KeyValuePair<string, string>("scope", scope)
+                    });
+                }
+                else
+                {
+                    request.Content = new StringContent("");
+                }
+
+                try
+                {
+                    HttpResponseMessage response = await client.SendAsync(request);
+                    response.EnsureSuccessStatusCode();
+                    string responseBody = await response.Content.ReadAsStringAsync();
+                    JObject jsonObject = JObject.Parse(responseBody);
+                    string accessToken = jsonObject["accessToken"]?.ToString();
+                    if (string.IsNullOrEmpty(accessToken))
+                    {
+                        accessToken = jsonObject["token"]?.ToString();
+                    }
+                    if (string.IsNullOrEmpty(accessToken))
+                    {
+                        throw new Exception("Token no encontrado");
+                    }
+                    return accessToken;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error al obtener el token en petición GetToken: {ex}");
+                    return null;
+                }
+            }
+        }
+
+        public async Task getVersion()
+        {
+            string token = await GetToken("YW5hbHl0aWNzX3N3OlRtMFF6QTlR", "analytics:installers:get");
+            if (token != null)
+            {
+                string response = await getAnalyticsInstallers(token);
+                JObject jsonObject = JObject.Parse(response);
+                this.LINK = jsonObject["data"]?["lastInstaller"]?["publicDllLink"]?.ToString();
+                this.VERSION = jsonObject["data"]?["lastInstaller"]?["Version"]?.ToString();
+                Text = $"Instalación Xpertme Analytics {VERSION}";
+            }
+            else
+            {
+                Console.WriteLine("No se pudo obtener el token desde get version.");
+            }
+        }
+
+        private void getAssemblyVersion()
+        {
+            System.Reflection.Assembly assembly = System.Reflection.Assembly.GetExecutingAssembly();
+            System.Diagnostics.FileVersionInfo fvi = System.Diagnostics.FileVersionInfo.GetVersionInfo(assembly.Location);
+            this.AssemblyVERSION = fvi.FileVersion;
+        }
+
+        public static async Task<string> getAnalyticsInstallers(string token)
+        {
+            string analyticsUrl = "https://api-academy.xpertcad.com/v2/analytics/users/getAnalyticsInstallers";
             var request = new HttpRequestMessage(HttpMethod.Post, analyticsUrl);
-            request.Headers.Add("authorization", $"{token}");
-
-            // El encabezado "Content-Type" se define dentro de `StringContent`, no en `Headers`
-            var requestBody = json;
+            request.Headers.Add("Authorization", $"Bearer {token}");
+            var requestBody = "{ \"mode\": \"dev\" }";
             request.Content = new StringContent(requestBody, Encoding.UTF8, "application/json");
 
             try
@@ -695,192 +601,283 @@ namespace instalador
                 HttpResponseMessage response = await client.SendAsync(request);
                 response.EnsureSuccessStatusCode();
                 string responseBody = await response.Content.ReadAsStringAsync();
-                // Parsear la respuesta JSON
-                JObject jsonResponse = JObject.Parse(responseBody);
-
-                // Extraer el valor de "insertId"
-                string insertId = jsonResponse["insertId"]?.ToString() ?? null;
-
-                return insertId; // Devuelve el insertId
+                return responseBody;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error al obtener los datos--: {ex.Message}");
+                Console.WriteLine($"Error al obtener los datos//: {ex.Message}");
                 return null;
             }
         }
 
-        /////////////////////////////////////////////////////////////////////------------Botones-----------///////////////////////////////////////////////////////////////////////
-        void pagina()
+        private void lblLikRegistro_Click(object sender, EventArgs e)
         {
-            // mostramos la página actual
-            paginas[indice].BringToFront();
-            switch (indice)
+            Process.Start(new ProcessStartInfo
             {
-                case 0:
-                    // bienvenida
-                    btnatras.Enabled = false;
-                    btnsiguiente.Enabled = true;
-                    break;
-                case 1:
-                    // aviso
-                    ckbAviso.Checked = false;
-                    btnatras.Enabled = true;
-                    btnsiguiente.Enabled = false;
-                    break;
-                case 2:
-                    // validacion
-                    btnatras.Enabled = true;
-                    btnsiguiente.Enabled = true;
-                    break;
-                case 3:
-                    // config
-                    btnatras.Enabled = true;
-                    btnsiguiente.Enabled = true;
-                    break;
-                case 4:
-                    // seleccion
-                    btnatras.Enabled = true;
-                    btnsiguiente.Enabled = true;
-                    break;
-                case 5:
-                    // ruta
-                    btnsiguiente.Text = "Siguiente";
-                    btnatras.Enabled = true;
-                    btnsiguiente.Enabled = true;
-                    break;
-                case 6:
-                    // para instalar
-                    btnsiguiente.Text = "Instalar";
-                    break;
-                case 7:
-                    btnsiguiente.Text = "Instalando...";
-                    btnsiguiente.Enabled = false;
-                    btnatras.Text = "Cancelar";
-                    break;
-                case 8:
-                    btnsiguiente.Enabled = false;
-                    btnatras.Enabled = true;
-                    lblNotUserClick.BringToFront();
-                    break;
-                default: break;
-            }
+                FileName = "https://accounts.xpertme.com/user/registerView",
+                UseShellExecute = true
+            });
         }
 
-        private async void btnsiguiente_Click(object sender, EventArgs e)
+        private string ObtenerRutaDesdeRegistro()
         {
-            if (indice == 2) // Página de validación de usuario
+            string source = null;
+            try
             {
-                // txtEmailValid.Text = "";
-                // txtContraseña.Text = "";
-                //txtEmailValid.Text = "supervisor@nctech.com.mx";
-                //txtContraseña.Text = "#2024Xpert";
-                if (!await getUserData()) {return;} 
-            }
-
-            if (indice == 3) // Capturamos los datos
-            {
-                email = txtEmailValid.Text;
-                password = txtContraseña.Text;
-                deviceAlias = txtDevice.Text;
-                code = selectedCustomerID.ToString();
-                GenerarCheckBoxes();
-            }
-
-            if (indice == 4) // Campuramos los activities
-            {
-                var seleccionados = ObtenerCheckBoxesSeleccionados();
-                string json = JsonConvert.SerializeObject(seleccionados, Formatting.Indented);
-                swActivies = json;
-                string format = "yyyy-MM-dd HH:mm:ss";
-                string Currenttinme = DateTime.Now.ToString(format);
-                deviceMAC = GetMacAddress();
-                osVersion = GetOperatingSystem();
-                deviceName = Environment.MachineName;
-
-                var requestBodyData = new
+                RegistryKey key = Registry.LocalMachine.OpenSubKey("SYSTEM\\CurrentControlSet\\Control\\ComputerName\\ComputerName");
+                if (key != null)
                 {
-                    code = "r5ncccmGhzLG",
-                    created_at = Currenttinme,
-                    UserEmail = email,
-                    userID = UserID,
-                    appCustomerID = code,
-                    deviceAlias = deviceAlias,
-                    deviceName = deviceName,
-                    deviceMAC = deviceMAC,
-                    soVersion = osVersion,
-                    swActivies = swActivies,
-                    Campus = campus,
-                    Career = "null"
-                };
-
-                // Convertir a string (JSON)
-                string jsonString = JsonConvert.SerializeObject(requestBodyData);
-                // Usa await para obtener el resultado de la tarea
-                deviceID = await createDevice(jsonString);
-            }
-
-            if (indice == paginas.Count - 1) Environment.Exit(0);
-            ++indice;
-            pagina();
-
-            if (btnsiguiente.Text == "Instalando...") // Página de instalacion
-            {
-                temp = Path.Combine(Path.GetTempPath(), AppName);
-                if (Directory.Exists(temp)) eliminarCarpeta(temp);
-                Directory.CreateDirectory(temp);
-                temp = Path.Combine(temp, ARCHIVO);
-                wc.DownloadFileAsync(new Uri(URL), temp);
-                // rtbprogreso.Text = "Descargando " + URL;
-                rtbprogreso.Text = "Descargando archivos";
-                lbprogreso.Text = "Instalando...";
-            }
-        }
-
-        private void btnatras_Click(object sender, EventArgs e)
-        {
-            if (indice == 0) return;
-
-            if (indice == 8) { indice = 2; pagina(); return; }
-            
-            if (btnatras.Text == "Cancelar")
-            {
-                // pedimos confirmación para salir
-                var d = MessageBox.Show("Seguro que quieres salir?", "Instalación", MessageBoxButtons.YesNo, MessageBoxIcon.Asterisk);
-                if (d == DialogResult.Yes)
-                {
-                    // cancelamos y salimos
-                    if (wc.IsBusy) wc.CancelAsync();
-                    Environment.Exit(0);
+                    object o = key.GetValue("Source");
+                    source = o?.ToString();
                 }
             }
-            --indice;
-            pagina();
+            catch (Exception e)
+            {
+                Debug.Print("Error de obtener usserID!!! " + e.ToString());
+            }
+            return source;
         }
 
-        // para ponerlo en el menú de inicio
-        private void addInicio()
+        public void GenerarAcordeonDeActividades()
         {
-            string commonStartMenuPath = Environment.GetFolderPath(Environment.SpecialFolder.CommonStartMenu);
-            string appStartMenuPath = Path.Combine(commonStartMenuPath, "Programs", txtmenuinicio.Text);
+            this.lyrSeleccion.Controls.Clear();
+            this.lyrSeleccion.Controls.Add(this.lblConfigSoft);
+            this.lyrSeleccion.Controls.Add(this.lbldescConfig);
 
-            if (!Directory.Exists(appStartMenuPath))
-                Directory.CreateDirectory(appStartMenuPath);
+            var scrollContainer = new Panel();
+            scrollContainer.Location = new Point(20, 80); // empieza desde Y=80
+            scrollContainer.Size = new Size(this.lyrSeleccion.Width - 40, this.lyrSeleccion.Height - 100);
+            scrollContainer.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right; // 🔥 se adapta
+            scrollContainer.AutoScroll = true;
+            scrollContainer.BackColor = Color.WhiteSmoke;
 
-            string shortcutLocation = Path.Combine(appStartMenuPath, AppName + ".lnk");
-            WshShell shell = new WshShell();
-            IWshShortcut shortcut = (IWshShortcut)shell.CreateShortcut(shortcutLocation);
+            this.lyrSeleccion.Controls.Add(scrollContainer);
 
-            shortcut.Description = "Muestra un mensaje";
-            shortcut.IconLocation = $@"{ruta}\{AppName}.ico"; //uncomment to set the icon of the shortcut
-            shortcut.TargetPath = pathToExe;
-            shortcut.Save();
+
+            var actividades = new Dictionary<string, List<Tuple<string, string>>>
+            {
+                {"Diseño", new List<Tuple<string, string>>
+                    {
+                        Tuple.Create("Part Modeling (Modelos de partes)", "Diseño de piezas prismáticas y complejas en 3D"),
+                        Tuple.Create("Surface Modeling (Modelado de superficies)", "Diseño avanzado usando superficies abiertas, ideal para geometrías complejas como automotrices o de consumo."),
+                        Tuple.Create("Sheet Metal (Chapa Metálica)", "Diseño de piezas en lámina doblada, con herramientas para dobleces, cortes y planos de fabricación."),
+                        Tuple.Create("Weldments (Estructuras Soldadas)", "Diseño de estructuras con perfiles estructurales (tubulares, ángulos, etc.), con cortes automáticos y listas de corte."),
+                        Tuple.Create("Mold Tools (Diseño de Moldes)", "Creación de cavidades, líneas de partición y herramientas específicas para moldes de inyección."),
+                        Tuple.Create("Multibody Part Design", "Permite crear múltiples cuerpos sólidos en una sola pieza para estudios o separación posterior."),
+                        Tuple.Create("3D Sketching", "Croquizado en 3D, útil para trayectorias, estruFcturas, tubos y recorridos complejos.")
+                    }},
+                {"Ensambles", new List<Tuple<string, string>>
+                    {
+                        Tuple.Create("Modelado ascendente de ensambles", "Modelado de cada parte de forma individual que posteriormente se insertan en un archivo de ensamble."),
+                        Tuple.Create("Modelado descendente de ensambles", "Creacion y/o modificacion de piezas dentro del propio entorno del ensamblaje utilizando la geometria de otros componentes como referencia."),
+                        Tuple.Create("Modelado de ensambles a partir de un modelo maestro", "Definicion basica de las piezas de un ensamble como solidos dentro de un documento de pieza que posteriormente se convierten y detallan en un ensamble vinculado."),
+                        Tuple.Create("Modelado de ensambles a partir de un layout", "Se inicia con un croquis en el ensamble que define el esqueleto del diseño, las posiciones y geometria basica de las piezas que lo componen.")
+                    }}
+            };
+
+            foreach (var categoria in actividades)
+            {
+                // Panel contenedor de cada acordeón
+                var accordionPanel = new Panel();
+                accordionPanel.Dock = DockStyle.Top;
+                accordionPanel.AutoSize = true;
+                accordionPanel.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+
+                // ===== HEADER =====
+                var headerPanel = new Panel();
+                headerPanel.Dock = DockStyle.Top;
+                headerPanel.Height = 40;
+                headerPanel.BackColor = System.Drawing.Color.White;
+                headerPanel.Padding = new Padding(10, 10, 10, 0);
+
+                var lblCategoria = new Label();
+                lblCategoria.Text = categoria.Key;
+                lblCategoria.Font = new System.Drawing.Font("Segoe UI", 11F, System.Drawing.FontStyle.Bold);
+                lblCategoria.Dock = DockStyle.Left;
+                lblCategoria.Cursor = Cursors.Hand;
+                lblCategoria.Click += HeaderLabel_Click;
+                headerPanel.Controls.Add(lblCategoria);
+
+                var arrowLabel = new Label();
+                arrowLabel.Text = "▼";
+                arrowLabel.Font = new System.Drawing.Font("Segoe UI", 11F, System.Drawing.FontStyle.Bold);
+                arrowLabel.Dock = DockStyle.Right;
+                arrowLabel.TextAlign = ContentAlignment.MiddleRight;
+                arrowLabel.Width = 30;
+                arrowLabel.Cursor = Cursors.Hand;
+                arrowLabel.Click += HeaderLabel_Click;
+                headerPanel.Controls.Add(arrowLabel);
+
+                // ===== CONTENT =====
+                var contentPanel = new Panel();
+                contentPanel.Dock = DockStyle.Top;
+                contentPanel.BackColor = System.Drawing.Color.White;
+                contentPanel.Padding = new Padding(10);
+                contentPanel.Height = 0; // inicia colapsado
+
+                foreach (var actividad in categoria.Value)
+                {
+                    var checkItemPanel = new Panel();
+                    checkItemPanel.Dock = DockStyle.Top;
+                    checkItemPanel.Height = 70;
+                    checkItemPanel.BackColor = System.Drawing.Color.White;
+                    checkItemPanel.Margin = new Padding(0, 0, 0, 5);
+
+                    var chk = new CheckBox();
+                    chk.Text = "";
+                    chk.Location = new System.Drawing.Point(0, 10);
+                    chk.Size = new System.Drawing.Size(30, 20);
+                    checkItemPanel.Controls.Add(chk);
+
+                    var lblTitulo = new Label();
+                    lblTitulo.Text = actividad.Item1;
+                    lblTitulo.Location = new System.Drawing.Point(25, 5);
+                    lblTitulo.Size = new System.Drawing.Size(680, 20);
+                    lblTitulo.Font = new System.Drawing.Font("Segoe UI", 10F, System.Drawing.FontStyle.Bold);
+                    checkItemPanel.Controls.Add(lblTitulo);
+
+                    var lblDescripcion = new Label();
+                    lblDescripcion.Text = actividad.Item2;
+                    lblDescripcion.Location = new System.Drawing.Point(25, 30);
+                    lblDescripcion.Size = new System.Drawing.Size(680, 35);
+                    lblDescripcion.Font = new System.Drawing.Font("Segoe UI", 9F);
+                    lblDescripcion.ForeColor = System.Drawing.Color.DimGray;
+                    checkItemPanel.Controls.Add(lblDescripcion);
+
+                    contentPanel.Controls.Add(checkItemPanel);
+                    contentPanel.Controls.SetChildIndex(checkItemPanel, 0);
+                }
+
+                // Guardamos altura real en Tag
+                contentPanel.Tag = categoria.Value.Count * 75;
+
+                // Agregar en orden correcto
+                accordionPanel.Controls.Add(contentPanel);
+                accordionPanel.Controls.Add(headerPanel);
+
+                scrollContainer.Controls.Add(accordionPanel);
+                scrollContainer.Controls.SetChildIndex(accordionPanel, 0);
+            }
         }
 
-        // para seleccionar la carpeta de instalación
+        private void HeaderLabel_Click(object sender, EventArgs e)
+        {
+            var clickedLabel = sender as Label;
+            if (clickedLabel == null) return;
+
+            var headerPanel = clickedLabel.Parent as Panel;
+            if (headerPanel == null) return;
+
+            var accordionPanel = headerPanel.Parent as Panel;
+            if (accordionPanel == null) return;
+
+            // El contentPanel siempre está debajo dentro del accordionPanel
+            var contentPanel = accordionPanel.Controls.OfType<Panel>().FirstOrDefault(p => p != headerPanel);
+
+            if (contentPanel != null)
+            {
+                if (contentPanel.Height == 0)
+                {
+                    // expandir
+                    int fullHeight = (int)contentPanel.Tag;
+                    contentPanel.Height = fullHeight;
+
+                    var arrow = headerPanel.Controls.OfType<Label>()
+                                    .FirstOrDefault(l => l.Text == "▼" || l.Text == "▲");
+                    if (arrow != null) arrow.Text = "▲";
+                }
+                else
+                {
+                    // colapsar
+                    contentPanel.Height = 0;
+
+                    var arrow = headerPanel.Controls.OfType<Label>()
+                                    .FirstOrDefault(l => l.Text == "▼" || l.Text == "▲");
+                    if (arrow != null) arrow.Text = "▼";
+                }
+            }
+        }
+
+        private List<Dictionary<string, string>> ObtenerCheckBoxesSeleccionados()
+        {
+            var actividadesSeleccionadas = new List<Dictionary<string, string>>();
+
+            foreach (Control control in lyrSeleccion.Controls)
+            {
+                // Buscar el contenedor scroll (Panel dinámico)
+                if (control is Panel scrollContainer)
+                {
+                    foreach (Control accordionPanel in scrollContainer.Controls)
+                    {
+                        if (accordionPanel is Panel)
+                        {
+                            // Buscar el contentPanel (donde están los checkItemPanel)
+                            foreach (Control contentPanel in accordionPanel.Controls)
+                            {
+                                // contentPanel válido
+                                if (contentPanel is Panel && contentPanel.Tag != null)
+                                {
+                                    foreach (Control checkItemPanel in contentPanel.Controls)
+                                    {
+                                        if (checkItemPanel is Panel)
+                                        {
+                                            // Buscar el CheckBox
+                                            var chk = checkItemPanel.Controls.OfType<CheckBox>().FirstOrDefault();
+                                            var lblTitulo = checkItemPanel.Controls.OfType<Label>().FirstOrDefault();
+
+                                            if (chk != null && chk.Checked && lblTitulo != null)
+                                            {
+                                                actividadesSeleccionadas.Add(new Dictionary<string, string>
+                                        {
+                                            { "activiti", lblTitulo.Text }
+                                        });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            return actividadesSeleccionadas;
+        }
+
+        public static string GetMacAddress()
+        {
+            try
+            {
+                var networkInterfaces = NetworkInterface.GetAllNetworkInterfaces();
+                var activeInterface = networkInterfaces.FirstOrDefault(nic => nic.OperationalStatus == OperationalStatus.Up && nic.NetworkInterfaceType != NetworkInterfaceType.Loopback);
+                if (activeInterface != null)
+                {
+                    return string.Join(":", activeInterface.GetPhysicalAddress().GetAddressBytes().Select(b => b.ToString("X2")));
+                }
+                return "No se encontró ninguna interfaz de red activa.";
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error al obtener la MAC Address: {ex.Message}");
+                return "Error al obtener la MAC Address";
+            }
+        }
+
+        public string GetOperatingSystem()
+        {
+            string windowsProductName = string.Empty;
+            RegistryKey key = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion");
+            if (key != null)
+            {
+                windowsProductName = key.GetValue("ProductName")?.ToString();
+                key.Close();
+                return windowsProductName;
+            }
+            return "ERROR!!";
+        }
+
         private void btncarpeta_Click(object sender, EventArgs e)
         {
-            // seleccionamos otra carpeta para la instalación
             FolderBrowserDialog fbd = new FolderBrowserDialog();
             if (fbd.ShowDialog() == DialogResult.OK)
             {
@@ -890,12 +887,10 @@ namespace instalador
             }
         }
 
-        // método para eliminar una carpeta por completo
         private void eliminarCarpeta(string ruta)
         {
             foreach (string ar in Directory.GetFiles(ruta)) System.IO.File.Delete(ar);
             foreach (string ca in Directory.GetDirectories(ruta)) eliminarCarpeta(ca);
-
             Directory.Delete(ruta);
         }
 
@@ -927,11 +922,11 @@ namespace instalador
                 Debug.Print("Error al escribir en el log.");
             }
         }
+
         private static string GetSource()
         {
-            string defaultSource = @"C:\ProgramData\SOLIDWORKS\analytics"; // Ruta por defecto
-            string source = null; // Inicialmente nulo
-
+            string defaultSource = @"C:\ProgramData\SOLIDWORKS\analytics";
+            string source = null;
             try
             {
                 RegistryKey key = Registry.LocalMachine.OpenSubKey("SYSTEM\\CurrentControlSet\\Control\\ComputerName\\ComputerName");
@@ -942,7 +937,7 @@ namespace instalador
                     {
                         source = o.ToString();
                     }
-                    key.Close(); 
+                    key.Close();
                 }
             }
             catch (Exception e)
@@ -953,7 +948,6 @@ namespace instalador
             {
                 source = defaultSource;
             }
-
             return source;
         }
     }
