@@ -73,6 +73,7 @@ namespace analytics_AddIn
         private string tempFolder;
         private string historyActionLogPath;
         private string summaryActionLogPath;
+        private string sessionSummaryLogPath;
         private long lastJournalFileSize = 0;
 
         #endregion
@@ -105,11 +106,26 @@ namespace analytics_AddIn
         private bool isConfigured;
 
         #endregion
+
+        #region Variables para el resumen de actividad de archivos
+
+        private List<string> openedFiles;
+        private Dictionary<string, int> usedFileFormats;
+        private int defaultTemplateCount;
+        private int customTemplateCount;
+        private string currentActiveDocName = "N/A";
+        private string currentActiveDocType = "N/A";
+        private string solidworksDefaultTemplatePath = @"C:\ProgramData\SolidWorks"; // Ruta de plantillas por default de solidworks
+
+        #endregion
         public Class1()
         {
             // El constructor ahora solo se encarga de llamar a los métodos de inicialización en orden.
             try
             {
+                openedFiles = new List<string>();
+                usedFileFormats = new Dictionary<string, int>();
+
                 // Primero las rutas, para que la función de log esté disponible inmediatamente.
                 InitializePaths();
                 // Luego, preparamos el sistema de seguimiento de actividad.
@@ -266,7 +282,255 @@ namespace analytics_AddIn
                 Debug.Print($"ERROR AL ESCRIBIR EN LOG '{LogFilePath}': {ex.Message}. Mensaje original: {message}");
             }
         }
+        /// ////////////////////////////////////////////////////////////////////////// Resumen de las sesiones ///////////////////////////////////////////////////////////////////////////////
 
+        private (DateTime? startDate, DateTime? endDate, TimeSpan activeTime, TimeSpan inactiveTime)
+        ExtractSessionTimes(string sessionFilePath)
+        {
+            DateTime? startDate = null;
+            DateTime? endDate = null;
+            TimeSpan activeTime = TimeSpan.Zero;
+            TimeSpan inactiveTime = TimeSpan.Zero;
+            DateTime? lastEventDate = null;
+            string lastAction = "";
+
+            if (!File.Exists(sessionFilePath)) return (null, null, TimeSpan.Zero, TimeSpan.Zero);
+
+            var lines = File.ReadAllLines(sessionFilePath).Where(l => !string.IsNullOrWhiteSpace(l)).ToList();
+
+            foreach (var line in lines)
+            {
+                var parts = line.TrimEnd(';').Split(',');
+                if (parts.Length < 2 || !DateTime.TryParse(parts[0], out DateTime eventDate)) continue;
+
+                if (startDate == null) startDate = eventDate;
+                endDate = eventDate;
+
+                if (lastEventDate != null)
+                {
+                    if (lastAction.Equals("Open", StringComparison.OrdinalIgnoreCase) ||
+                        lastAction.Equals("ActivePulse", StringComparison.OrdinalIgnoreCase))
+                    {
+                        activeTime += eventDate - lastEventDate.Value;
+                    }
+                    else
+                    {
+                        inactiveTime += eventDate - lastEventDate.Value;
+                    }
+                }
+
+                lastEventDate = eventDate;
+                lastAction = parts[1].Trim();
+            }
+
+            return (startDate, endDate, activeTime, inactiveTime);
+        }
+
+
+        private List<FileSummary> ExtractFileActivity(string historyFilePath)
+        {
+            const string SEPARATOR = "|||";
+            var resultByFile = new Dictionary<string, FileSummary>(StringComparer.OrdinalIgnoreCase);
+
+            if (!File.Exists(historyFilePath)) return resultByFile.Values.ToList();
+
+            var lines = File.ReadAllLines(historyFilePath).ToList();
+            if (lines.Count == 0) return resultByFile.Values.ToList();
+
+            // 1) Encuentra el ÚLTIMO EndFile, y el ÚLTIMO StartFile ANTES de ese EndFile
+            int endIndex = -1;
+            for (int i = lines.Count - 1; i >= 0; i--)
+            {
+                if (lines[i].Equals("EndFile", StringComparison.OrdinalIgnoreCase))
+                {
+                    endIndex = i;
+                    break;
+                }
+            }
+            if (endIndex == -1) return resultByFile.Values.ToList(); // no hay session cerrada
+
+            int startIndex = -1;
+            for (int i = endIndex - 1; i >= 0; i--)
+            {
+                if (lines[i].Equals("StartFile", StringComparison.OrdinalIgnoreCase))
+                {
+                    startIndex = i;
+                    break;
+                }
+            }
+            if (startIndex == -1 || endIndex <= startIndex) return resultByFile.Values.ToList();
+
+            // 2) Procesa solo el bloque de la sesión anterior
+            for (int i = startIndex + 1; i < endIndex; i++)
+            {
+                var line = lines[i];
+                if (string.IsNullOrWhiteSpace(line)) continue;
+
+                var parts = line.Split(new string[] { SEPARATOR }, StringSplitOptions.None);
+                if (parts.Length < 5) continue;
+
+                string rawDoc = (parts[0] ?? "").Trim();           // docName (a veces puede traer extensión por errores previos)
+                string rawExt = (parts[1] ?? "").Trim().ToLower(); // ".sldprt", ".sldasm", ".prtdot", "n/a"
+                string action = (parts[2] ?? "").Trim();
+                string value = (parts[3] ?? "").Trim();
+                // string ts = parts[4] (no se usa aquí)
+
+                // 2.1) Normaliza docName + ext. Intenta deducir lo que falte.
+                NormalizeDocAndExt(rawDoc, rawExt, value, out string docName, out string extNoDot);
+
+                if (string.IsNullOrWhiteSpace(docName)) docName = "N/A";
+                if (string.IsNullOrWhiteSpace(extNoDot)) extNoDot = "na";
+
+                string fileName = $"{docName}.{extNoDot}";
+                string fileKey = fileName.ToLowerInvariant();
+
+                // 2.2) Crea/obtiene el resumen por archivo
+                if (!resultByFile.TryGetValue(fileKey, out var fileSummary))
+                {
+                    fileSummary = new FileSummary
+                    {
+                        fileName = fileName,
+                        format = extNoDot,
+                        template = false
+                    };
+                    resultByFile[fileKey] = fileSummary;
+                }
+
+                // 2.3) Marca si proviene de plantilla
+                //     Regla: si se registró "Nuevo Documento" para este archivo => template = true
+                //     (Da igual si default o custom; si quieres distinguir, aquí puedes mirar la ruta 'value')
+                if (action.Equals("Nuevo Documento", StringComparison.OrdinalIgnoreCase))
+                {
+                    fileSummary.template = true;
+                }
+
+                // 2.4) Suma la acción
+                if (!string.IsNullOrWhiteSpace(action))
+                {
+                    if (!fileSummary.actions.ContainsKey(action))
+                        fileSummary.actions[action] = 1;
+                    else
+                        fileSummary.actions[action]++;
+                }
+            }
+
+            return resultByFile.Values.ToList();
+        }
+
+        // Ayuda: normaliza docName/extension a partir de los 3 campos posibles
+        private void NormalizeDocAndExt(string rawDoc, string rawExt, string value, out string docName, out string extNoDot)
+        {
+            // 1) Extensión base
+            string ext = string.IsNullOrWhiteSpace(rawExt) || rawExt.Equals("n/a", StringComparison.OrdinalIgnoreCase)
+                        ? ""
+                        : rawExt.Trim().ToLower();
+
+            // 2) Si doc viene con extensión, sepárala
+            string doc = (rawDoc ?? "").Trim();
+            string docExtFromDoc = Path.GetExtension(doc);
+            if (!string.IsNullOrEmpty(docExtFromDoc))
+            {
+                if (string.IsNullOrEmpty(ext))
+                    ext = docExtFromDoc.ToLower(); // usa la del doc si rawExt viene vacío
+
+                doc = Path.GetFileNameWithoutExtension(doc);
+            }
+
+            // 3) Si aún no hay extensión, intenta sacarla de 'value'
+            if (string.IsNullOrEmpty(ext) && !string.IsNullOrWhiteSpace(value))
+            {
+                string extFromValue = Path.GetExtension(value);
+                if (!string.IsNullOrEmpty(extFromValue))
+                    ext = extFromValue.ToLower();
+            }
+
+            // 4) Normaliza a "sldprt" sin punto
+            if (ext.StartsWith(".")) ext = ext.Substring(1);
+            if (string.IsNullOrWhiteSpace(doc) || doc.Equals("n/a", StringComparison.OrdinalIgnoreCase))
+            {
+                // último intento: del 'value'
+                if (!string.IsNullOrWhiteSpace(value))
+                    doc = Path.GetFileNameWithoutExtension(value);
+            }
+
+            docName = doc;
+            extNoDot = ext;
+        }
+
+
+        private void GenerateSessionSummary()
+        {
+            try
+            {
+                // 1) Tiempos de sesión (lee de ConfigFilePath)
+                var sessionTimes = ExtractSessionTimes(ConfigFilePath);
+                // Si quieres el formato ISO con 'T', puedes hacer:
+                string startIso = ToIso(sessionTimes.startDate.ToString());
+                string endIso = ToIso(sessionTimes.endDate.ToString());
+
+                // 2) Actividad por archivo (lee de HistoryAction.log)
+                var filesBySession = ExtractFileActivity(historyActionLogPath);
+
+                // 3) Construir el objeto final
+                var summary = new
+                {
+                    session = new
+                    {
+                        start_date = startIso,                   // "2025-09-04T18:01:58"
+                        end_date = endIso,                       // "2025-09-04T18:05:06"
+                        active_time = sessionTimes.activeTime,   // "HH:mm:ss"
+                        inactive_time = sessionTimes.inactiveTime,
+                        files = filesBySession                   // ← LISTA de FileSummary
+                    }
+                };
+
+                // 4) Guardar acumulando en JSON array
+                List<object> allSessions;
+                if (File.Exists(sessionSummaryLogPath))
+                {
+                    var existing = File.ReadAllText(sessionSummaryLogPath).Trim();
+                    allSessions = string.IsNullOrEmpty(existing)
+                        ? new List<object>()
+                        : JsonConvert.DeserializeObject<List<object>>(existing) ?? new List<object>();
+                }
+                else
+                {
+                    allSessions = new List<object>();
+                }
+
+                allSessions.Add(summary);
+
+                var json = JsonConvert.SerializeObject(allSessions, Formatting.Indented);
+                File.WriteAllText(sessionSummaryLogPath, json);
+
+                LogToFile("Resumen de sesión generado y almacenado en SessionSummary.log", "INFO");
+            }
+            catch (Exception ex)
+            {
+                LogToFile($"Error al generar el resumen de sesión: {ex.Message}", "ERROR");
+            }
+        }
+
+        private string ToIso(string dt)
+        {
+            // Si ya guardas "yyyy-MM-dd HH:mm:ss", conviértelo a "yyyy-MM-ddTHH:mm:ss"
+            if (string.IsNullOrWhiteSpace(dt)) return "N/A";
+            DateTime parsed;
+            if (DateTime.TryParse(dt, out parsed))
+                return parsed.ToString("yyyy-MM-dd'T'HH:mm:ss");
+            // fallback: reemplazar espacio por 'T'
+            return dt.Replace(' ', 'T');
+        }
+        /// <summary>
+        /// Reinicia todos los contadores y listas de la sesión de actividad de archivos.
+        /// </summary>
+        private void ResetFileActivityCounters()
+        {
+            openedFiles.Clear();
+            usedFileFormats.Clear();
+            defaultTemplateCount = 0;
+            customTemplateCount = 0;
+        }
         /// 
         /// ////////////////////////////////////////////////////////////////////////// Monitoreo de Archivo Journal /////////////////////////////////////////////////////////////////////////
         /// 
@@ -506,37 +770,63 @@ namespace analytics_AddIn
             {
                 var actionsToLog = new List<string>();
 
-                foreach (var line in newLines)
-                {
+                foreach(var line in newLines)
+{
                     if (string.IsNullOrWhiteSpace(line) || line.Trim().StartsWith("'") || line.Trim().StartsWith("Dim ")) continue;
 
-                    // Gracias al orden del diccionario, la primera coincidencia que encontremos será la más específica.
                     foreach (var entry in actionDictionary)
                     {
                         if (line.Contains(entry.Key))
                         {
                             string action = entry.Value;
-
-                            // Lógica anti-spam solo para los eventos de vista que se repiten mucho
-                            if ((action == "Rotar Vista" || action == "Rodar Vista") &&
-                                action == lastLoggedAction && (DateTime.Now - lastLoggedTime).TotalSeconds < 2)
-                            {
-                                continue; // Ignora este evento repetido, pero sigue buscando otras acciones en la misma línea
-                            }
-
                             string value = ExtractValueFromLine(line, action);
-
-                            if (value.Contains("C:\\ProgramData\\SolidWorks\\SOLIDWORKS 2025"))
-                            {
-                                value = value.Split('\\')[4];
-                            }
                             string timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
-                            actionsToLog.Add($"{action}, {value}, {timestamp}");
 
-                            lastLoggedAction = action;
-                            lastLoggedTime = DateTime.Now;
+                            if (action == "Nuevo Documento")
+                            {
+                                currentActiveDocName = Path.GetFileNameWithoutExtension(value); // value = ruta de plantilla
+                                currentActiveDocType = Path.GetExtension(value);                // ".prtdot", ".asmdot", ".drwdot"
+                            }
+                            else if (action == "Documento activo")
+                            {
+                                // value puede ser "Ensamblaje1.SLDASM" o solo "Ensamblaje1"
+                                if (!string.IsNullOrWhiteSpace(value))
+                                {
+                                    string ext = Path.GetExtension(value); // ".SLDASM" o ""
+                                    if (!string.IsNullOrEmpty(ext))
+                                    {
+                                        currentActiveDocName = Path.GetFileNameWithoutExtension(value);
+                                        currentActiveDocType = ext; // usar la real
+                                    }
+                                    else
+                                    {
+                                        currentActiveDocName = value;
+                                        if (string.IsNullOrEmpty(currentActiveDocType) || currentActiveDocType.Equals("N/A", StringComparison.OrdinalIgnoreCase))
+                                            currentActiveDocType = ".sldprt"; // fallback si no hay info
+                                    }
+                                }
+                            }
+                            // Al cerrar, si viene ruta/nombre con extensión, también actualiza:
+                            else if (action == "Cerrar Documento" || action == "Guardar Documento")
+                            {
+                                if (!string.IsNullOrWhiteSpace(value))
+                                {
+                                    string ext = Path.GetExtension(value);
+                                    if (!string.IsNullOrEmpty(ext))
+                                    {
+                                        currentActiveDocName = Path.GetFileNameWithoutExtension(value);
+                                        currentActiveDocType = ext;
+                                    }
+                                }
+                            }
 
-                            break; // Encontramos la acción más específica para esta línea, pasamos a la siguiente.
+                            // Al escribir la línea, no dejes campos vacíos
+                            string docName = string.IsNullOrWhiteSpace(currentActiveDocName) ? "N/A" : currentActiveDocName;
+                            string docType = string.IsNullOrWhiteSpace(currentActiveDocType) ? "N/A" : currentActiveDocType.ToLower();
+                            string logLine = $"{docName}|||{docType}|||{action}|||{value}|||{DateTime.Now:yyyy-MM-dd HH:mm:ss}";
+                            actionsToLog.Add(logLine);
+
+                            break;
                         }
                     }
                 }
@@ -547,12 +837,63 @@ namespace analytics_AddIn
                     {
                         File.AppendAllLines(historyActionLogPath, actionsToLog);
                     }
-                    LogToFile($"Registradas {actionsToLog.Count} nuevas acciones en HistoryAction.log.", "DEBUG");
                 }
             }
             catch (Exception ex)
             {
                 LogToFile($"Error procesando líneas del Journal: {ex.ToString()}", "ERROR");
+            }
+        }
+
+        /// <summary>
+        /// Analiza una acción relacionada con un archivo para contar formatos, plantillas y archivos abiertos.
+        /// </summary>
+        private void AnalyzeAndRecordFileAction(string action, string fullPath)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(fullPath)) return;
+
+                // 1. Contar formatos de archivo (extensiones)
+                string extension = Path.GetExtension(fullPath).ToLower(); // ej: ".sldprt"
+                if (!string.IsNullOrEmpty(extension))
+                {
+                    if (usedFileFormats.ContainsKey(extension))
+                    {
+                        usedFileFormats[extension]++;
+                    }
+                    else
+                    {
+                        usedFileFormats[extension] = 1;
+                    }
+                }
+
+                // 2. Analizar si es una plantilla personalizada o por defecto (solo para la acción "Nuevo Documento")
+                if (action == "Nuevo Documento")
+                {
+                    // Tu teoría es correcta: si la ruta de la plantilla NO empieza con la ruta por defecto, es personalizada.
+                    if (fullPath.StartsWith(solidworksDefaultTemplatePath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        defaultTemplateCount++;
+                        LogToFile($"Detectada plantilla por defecto: {fullPath}", "DEBUG");
+                    }
+                    else
+                    {
+                        customTemplateCount++;
+                        LogToFile($"Detectada plantilla PERSONALIZADA: {fullPath}", "DEBUG");
+                    }
+                }
+
+                // 3. Añadir a la lista de archivos abiertos (si no está ya en la lista)
+                string fileName = Path.GetFileName(fullPath);
+                if (!openedFiles.Contains(fileName))
+                {
+                    openedFiles.Add(fileName);
+                }
+            }
+            catch (Exception ex)
+            {
+                LogToFile($"Error analizando la acción de archivo '{action}': {ex.ToString()}", "ERROR");
             }
         }
 
@@ -719,77 +1060,7 @@ namespace analytics_AddIn
         }
 
         /// <summary>
-        /// Lee el archivo de historial de acciones, cuenta las ocurrencias de cada acción y
-        /// escribe el resultado en un archivo de resumen.
-        /// </summary>
-        private void GenerateActionSummary()
-        {
-            try
-            {
-                LogToFile("Generando resumen de acciones...", "INFO");
-                if (!File.Exists(historyActionLogPath))
-                {
-                    LogToFile("No se encontró HistoryAction.log para generar el resumen.", "WARNING");
-                    return;
-                }
-
-                // Usamos un diccionario para contar cada acción.
-                var actionCounts = new Dictionary<string, int>();
-
-                // Leemos todas las líneas del log de historial.
-                var historyLines = File.ReadLines(historyActionLogPath);
-
-                foreach (var line in historyLines)
-                {
-                    // Ignoramos los marcadores de inicio y fin de sesión.
-                    if (string.IsNullOrWhiteSpace(line) ||
-                        line.Equals("StartFile", StringComparison.OrdinalIgnoreCase) ||
-                        line.Equals("EndFile", StringComparison.OrdinalIgnoreCase))
-                    {
-                        continue;
-                    }
-
-                    // Extraemos el nombre de la acción (es la primera parte antes de la coma).
-                    string action = line.Split(',')[0].Trim();
-
-                    // Contamos la acción.
-                    if (actionCounts.ContainsKey(action))
-                    {
-                        actionCounts[action]++;
-                    }
-                    else
-                    {
-                        actionCounts[action] = 1;
-                    }
-                }
-
-                // Si no hay acciones que contar, no creamos el archivo.
-                if (!actionCounts.Any())
-                {
-                    LogToFile("No se encontraron acciones para resumir.", "INFO");
-                    return;
-                }
-
-                // Preparamos las líneas para el archivo de resumen.
-                var summaryLines = new List<string>();
-                foreach (var entry in actionCounts)
-                {
-                    summaryLines.Add($"{entry.Key}, {entry.Value}"); // Formato: Acción, Conteo
-                }
-
-                // Escribimos el archivo de resumen, sobrescribiendo el anterior.
-                MessageBox.Show(summaryActionLogPath);
-                File.WriteAllLines(summaryActionLogPath, summaryLines);
-                LogToFile($"Resumen de acciones guardado exitosamente en: {summaryActionLogPath}", "INFO");
-            }
-            catch (Exception ex)
-            {
-                LogToFile($"Error al generar el resumen de acciones: {ex.ToString()}", "ERROR");
-            }
-        }
-
-        /// <summary>
-        /// Genera el resumen, cierra el log de historial y mueve ambos archivos a sus carpetas de respaldo.
+        /// Finaliza y respalda los logs de una sesión anterior.
         /// </summary>
         private void FinalizeAndBackupSessionLogs(DateTime backupDate)
         {
@@ -797,29 +1068,27 @@ namespace analytics_AddIn
             {
                 if (!File.Exists(historyActionLogPath)) return;
 
+                // 2. Ahora sí, cerramos el log de historial (añade EndFile si falta).
                 EnsurePreviousHistoryLogIsClosed();
-                GenerateActionSummary();
 
+                // 4. Lógica de respaldo...
                 string timestamp = backupDate.ToString("yyyy-MM-dd");
-
-                // Mover HistoryAction.log
                 string historyBackupDir = Path.Combine(baseApplicationDataFolder, "History_Backups");
                 string newHistoryPath = Path.Combine(historyBackupDir, $"HistoryAction_{timestamp}.log");
                 File.Move(historyActionLogPath, newHistoryPath);
                 LogToFile($"Archivo de historial respaldado en: {newHistoryPath}", "INFO");
 
-                // Mover LogAction.log (si se creó)
                 if (File.Exists(summaryActionLogPath))
                 {
                     string summaryBackupDir = Path.Combine(baseApplicationDataFolder, "Summary_Backups");
                     string newSummaryPath = Path.Combine(summaryBackupDir, $"LogAction_{timestamp}.log");
                     File.Move(summaryActionLogPath, newSummaryPath);
-                    LogToFile($"Archivo de resumen respaldado en: {newSummaryPath}", "INFO");
+                    LogToFile($"Archivo de resumen de acciones respaldado en: {newSummaryPath}", "INFO");
                 }
             }
             catch (Exception ex)
             {
-                LogToFile($"Error al finalizar y respaldar los logs: {ex.ToString()}", "ERROR");
+                LogToFile($"Error al finalizar y respaldar los logs de sesión: {ex.ToString()}", "ERROR");
             }
         }
 
@@ -831,32 +1100,30 @@ namespace analytics_AddIn
         {
             try
             {
-                // Si el archivo de historial no existe, simplemente creamos uno nuevo para hoy.
                 if (!File.Exists(historyActionLogPath))
                 {
+                    // --- AÑADE LA LLAMADA AQUÍ ---
+                    ResetFileActivityCounters();
                     File.WriteAllText(historyActionLogPath, "StartFile\r\n");
-                    LogToFile("Nuevo HistoryAction.log iniciado para la sesión actual.", "INFO");
+                    LogToFile("Nuevo HistoryAction.log iniciado.", "INFO");
                     return;
                 }
 
-                // Si el archivo existe, obtenemos su fecha de última modificación.
                 DateTime lastLogDate = File.GetLastWriteTime(historyActionLogPath).Date;
                 DateTime today = DateTime.Now.Date;
 
-                // Comparamos si el log es de un día anterior.
                 if (lastLogDate < today)
                 {
-                    LogToFile($"Detectado log del día anterior ({lastLogDate:yyyy-MM-dd}). Finalizando y respaldando...", "INFO");
-                    FinalizeAndBackupSessionLogs(lastLogDate); // Usamos la fecha del log para el nombre del respaldo.
+                    LogToFile($"Detectado log del día anterior. Finalizando y respaldando...", "INFO");
+                    FinalizeAndBackupSessionLogs(lastLogDate);
 
-                    // Creamos un nuevo log para el día de hoy.
+                    // --- AÑADE LA LLAMADA AQUÍ ---
+                    ResetFileActivityCounters();
                     File.WriteAllText(historyActionLogPath, "StartFile\r\n");
-                    LogToFile("Nuevo HistoryAction.log iniciado para la sesión actual.", "INFO");
+                    LogToFile("Nuevo HistoryAction.log iniciado para el nuevo día.", "INFO");
                 }
                 else
                 {
-                    // Si es del mismo día, solo nos aseguramos de que la sesión anterior esté cerrada
-                    // y añadimos un nuevo bloque StartFile.
                     LogToFile("Continuando con el HistoryAction.log del día de hoy.", "INFO");
                     EnsurePreviousHistoryLogIsClosed();
                     File.AppendAllText(historyActionLogPath, "StartFile\r\n");
@@ -1149,6 +1416,7 @@ namespace analytics_AddIn
             tempFolder = Path.Combine(baseApplicationDataFolder, "temp");
             historyActionLogPath = Path.Combine(baseApplicationDataFolder, "HistoryAction.log");
             summaryActionLogPath = Path.Combine(baseApplicationDataFolder, "LogAction.log");
+            sessionSummaryLogPath = Path.Combine(baseApplicationDataFolder, "SessionSummary.log");
 
 
             Directory.CreateDirectory(tempFolder);
@@ -2170,26 +2438,28 @@ namespace analytics_AddIn
 
             LogToFile("SolidWorks inactivo (Idle). Iniciando tareas de fondo...", "INFO");
 
-            // --- NUEVA LÓGICA DE GESTIÓN DE LOGS DIARIOS ---
+            // --- LÓGICA DE GESTIÓN DE LOGS DIARIOS ---
             ManageLogLifecycleOnStartup();
 
             // Inicia el monitoreo del archivo Journal para la sesión actual.
             InitializeJournalMonitoring();
 
-            // Revisa si la sesión .txt anterior tuvo un crash.
+            // Revisa si la sesión .txt anterior tuvo un crash y registra la entrada "Crash".
             HandlePreviousSessionCrash();
+
+            GenerateSessionSummary();
 
             // Ejecuta las tareas de red en segundo plano.
             Task.Run(async () => {
                 if (IsInternetAvailable())
                 {
                     await CheckForUpdates();
-                    await SendSesionSW();
+                    await SendSesionSW(); // Esto procesará y borrará el .txt después de que el resumen ya fue creado.
                     await SendJwl();
                 }
             });
 
-            // Nos damos de baja del evento para no volver a ser llamados.
+            // Nos damos de baja del evento.
             ((SldWorks)solidWorksApp).OnIdleNotify -= new DSldWorksEvents_OnIdleNotifyEventHandler(OnIdleNotifyHandler);
             LogToFile("Tareas de fondo iniciadas. Desuscripción de OnIdleNotify completada.", "INFO");
 
@@ -2197,4 +2467,17 @@ namespace analytics_AddIn
         }
     }
 
+
+    class FileSummary
+    {
+        public string fileName { get; set; }          // "hexagono.sldprt"
+        public string format { get; set; }            // "sldprt" (sin punto)
+        public bool template { get; set; }            // true/false
+        public Dictionary<string, int> actions { get; set; }
+
+        public FileSummary()
+        {
+            actions = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        }
+    }
 }
